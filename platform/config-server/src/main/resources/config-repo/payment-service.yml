@@ -1,0 +1,4 @@
+payment:
+  simulator:
+    mode: SUCCESS             # SUCCESS | FAILURE | RANDOM | PENDING (also switchable at runtime by an ADMIN)
+    delay-ms: 0

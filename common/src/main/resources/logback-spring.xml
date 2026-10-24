@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <springProperty scope="context" name="appName" source="spring.application.name" defaultValue="app"/>
+  <property name="PATTERN"
+            value="%d{HH:mm:ss.SSS} %-5level [${appName},trace=%X{traceId:-},corr=%X{correlationId:-},booking=%X{bookingId:-}] %logger{36} - %msg%n"/>
+
+  <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder><pattern>${PATTERN}</pattern></encoder>
+  </appender>
+
+  <!-- Activate with SPRING_PROFILES_ACTIVE=elk to ship JSON logs to Logstash -->
+  <springProfile name="elk">
+    <appender name="LOGSTASH" class="net.logstash.logback.appender.LogstashTcpSocketAppender">
+      <destination>${LOGSTASH_DEST:-localhost:5000}</destination>
+      <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+        <customFields>{"service":"${appName}"}</customFields>
+      </encoder>
+    </appender>
+    <root level="INFO">
+      <appender-ref ref="CONSOLE"/>
+      <appender-ref ref="LOGSTASH"/>
+    </root>
+  </springProfile>
+
+  <springProfile name="!elk">
+    <root level="INFO"><appender-ref ref="CONSOLE"/></root>
+  </springProfile>
+</configuration>

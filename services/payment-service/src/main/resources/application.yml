@@ -1,0 +1,94 @@
+server:
+  port: 8083
+
+spring:
+  application:
+    name: payment-service
+  config:
+    import: optional:configserver:${CONFIG_SERVER_URL:http://localhost:8888}
+  datasource:
+    url: ${DB_URL:jdbc:mysql://localhost:3306/payment_db?createDatabaseIfNotExist=true&serverTimezone=UTC}
+    username: ${DB_USERNAME:root}
+    password: ${DB_PASSWORD:root}
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: ${JWK_SET_URI:http://localhost:8180/realms/tickethub/protocol/openid-connect/certs}
+
+eureka:
+  client:
+    service-url:
+      defaultZone: ${EUREKA_URL:http://localhost:8761/eureka}
+  instance:
+    prefer-ip-address: true
+    instance-id: ${spring.application.name}:${random.value}
+
+tickethub:
+  internal:
+    key: ${INTERNAL_API_KEY:dev-internal-key}
+  clients:
+    timeout-ms: 3000
+    booking:
+      base-url: http://booking-service
+
+# simulated = built-in controllable provider (default, used in tests/demo)
+# razorpay  = real provider SANDBOX (test keys); set the PAYMENT_RAZORPAY_* env vars
+payment:
+  provider: ${PAYMENT_PROVIDER:simulated}
+  webhook:
+    secret: ${PAYMENT_WEBHOOK_SECRET:dev-webhook-secret}
+  simulator:
+    mode: SUCCESS          # SUCCESS | FAILURE | RANDOM | PENDING
+    delay-ms: 0
+    failure-rate: 0.3
+  razorpay:
+    base-url: https://api.razorpay.com
+    key-id: ${PAYMENT_RAZORPAY_KEY_ID:}
+    key-secret: ${PAYMENT_RAZORPAY_KEY_SECRET:}
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      bookingService:
+        sliding-window-size: 10
+        minimum-number-of-calls: 5
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 3
+        record-exceptions:
+          - org.springframework.web.client.ResourceAccessException
+          - org.springframework.web.client.HttpServerErrorException
+        ignore-exceptions:
+          - com.tickethub.common.error.BusinessException
+  retry:
+    instances:
+      bookingService:
+        max-attempts: 3
+        wait-duration: 200ms
+        retry-exceptions:
+          - org.springframework.web.client.ResourceAccessException
+          - org.springframework.web.client.HttpServerErrorException
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics,circuitbreakers
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  tracing:
+    sampling:
+      probability: 1.0
+  otlp:
+    tracing:
+      endpoint: ${OTLP_TRACING_ENDPOINT:http://localhost:4318/v1/traces}
+  metrics:
+    tags:
+      application: ${spring.application.name}

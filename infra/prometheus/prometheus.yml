@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 10s
+
+scrape_configs:
+  - job_name: tickethub
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ['api-gateway:8080']
+        labels: { service: api-gateway }
+      - targets: ['event-service:8081']
+        labels: { service: event-service }
+      - targets: ['booking-service:8082']
+        labels: { service: booking-service }
+      - targets: ['payment-service:8083']
+        labels: { service: payment-service }
+      - targets: ['notification-service:8084']
+        labels: { service: notification-service }

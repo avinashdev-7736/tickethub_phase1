@@ -1,0 +1,7 @@
+# Shared by every service. NON-SECRET settings only.
+# Secrets (DB passwords, internal key, provider keys, webhook secret) come from environment variables /
+# AWS Secrets Manager - never from this repository.
+management:
+  tracing:
+    sampling:
+      probability: 1.0

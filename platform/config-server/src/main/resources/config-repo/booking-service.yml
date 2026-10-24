@@ -1,0 +1,5 @@
+# Tunable without rebuilding the image (restart the service to pick up changes).
+booking:
+  expiry-minutes: 10          # how long unpaid seats are held
+  scan-interval-ms: 30000     # how often the expiry job runs
+  max-seats-per-booking: 6

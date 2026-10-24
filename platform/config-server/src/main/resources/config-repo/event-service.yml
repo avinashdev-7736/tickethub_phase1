@@ -1,0 +1,3 @@
+tickethub:
+  seed:
+    enabled: true             # demo venue/event/show on first start

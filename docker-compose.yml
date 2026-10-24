@@ -1,0 +1,265 @@
+# TicketHub Phase 1 - full stack.
+#   docker compose up -d --build                         core stack (infra + 4 services + platform + monitoring)
+#   docker compose --profile failover up -d              adds a 2nd booking-service instance (discovery/failover demo)
+#   APP_PROFILES=docker,elk docker compose --profile elk up -d --build     adds ELK log search
+name: tickethub
+
+x-app-env: &app-env
+  SPRING_PROFILES_ACTIVE: ${APP_PROFILES:-docker}
+  CONFIG_SERVER_URL: http://config-server:8888
+  EUREKA_URL: http://discovery-server:8761/eureka
+  JWK_SET_URI: http://keycloak:8080/realms/tickethub/protocol/openid-connect/certs
+  OTLP_TRACING_ENDPOINT: http://jaeger:4318/v1/traces
+  LOGSTASH_DEST: logstash:5000
+  INTERNAL_API_KEY: ${INTERNAL_API_KEY:-dev-internal-key}
+  DB_USERNAME: root
+  DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+
+services:
+  # ------------------------------------------------------------------ infrastructure
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+    ports: ["3306:3306"]
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./infra/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  kafka:
+    image: apache/kafka:3.7.0
+    ports: ["29092:29092"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,EXTERNAL://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    command: start-dev --import-realm
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports: ["8180:8080"]
+    volumes:
+      - ./infra/keycloak/tickethub-realm.json:/opt/keycloak/data/import/tickethub-realm.json:ro
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports: ["8025:8025", "1025:1025"]   # UI on 8025, SMTP on 1025
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports: ["16686:16686", "4318:4318"]
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports: ["3000:3000"]
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on: [prometheus]
+
+  # ------------------------------------------------------------------ platform
+  discovery-server:
+    build: { context: ., args: { MODULE_PATH: platform/discovery-server } }
+    image: tickethub/discovery-server:local
+    ports: ["8761:8761"]
+    environment:
+      EUREKA_HOSTNAME: discovery-server
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8761/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  config-server:
+    build: { context: ., args: { MODULE_PATH: platform/config-server } }
+    image: tickethub/config-server:local
+    ports: ["8888:8888"]
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8888/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  api-gateway:
+    build: { context: ., args: { MODULE_PATH: platform/api-gateway } }
+    image: tickethub/api-gateway:local
+    ports: ["8080:8080"]
+    restart: on-failure
+    environment: *app-env
+    depends_on:
+      config-server: { condition: service_healthy }
+      discovery-server: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8080/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # ------------------------------------------------------------------ services
+  event-service:
+    build: { context: ., args: { MODULE_PATH: services/event-service } }
+    image: tickethub/event-service:local
+    ports: ["8081:8081"]
+    restart: on-failure
+    environment:
+      <<: *app-env
+      DB_URL: jdbc:mysql://mysql:3306/event_db?serverTimezone=UTC
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_REGION: ${S3_REGION:-ap-south-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    depends_on:
+      mysql: { condition: service_healthy }
+      config-server: { condition: service_healthy }
+      discovery-server: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8081/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  booking-service:
+    build: { context: ., args: { MODULE_PATH: services/booking-service } }
+    image: tickethub/booking-service:local
+    ports: ["8082:8082"]
+    restart: on-failure
+    environment:
+      <<: *app-env
+      DB_URL: jdbc:mysql://mysql:3306/booking_db?serverTimezone=UTC
+      KAFKA_BOOTSTRAP: kafka:9092
+    depends_on:
+      mysql: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      config-server: { condition: service_healthy }
+      discovery-server: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8082/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  payment-service:
+    build: { context: ., args: { MODULE_PATH: services/payment-service } }
+    image: tickethub/payment-service:local
+    ports: ["8083:8083"]
+    restart: on-failure
+    environment:
+      <<: *app-env
+      DB_URL: jdbc:mysql://mysql:3306/payment_db?serverTimezone=UTC
+      PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-simulated}
+      PAYMENT_WEBHOOK_SECRET: ${PAYMENT_WEBHOOK_SECRET:-dev-webhook-secret}
+      PAYMENT_RAZORPAY_KEY_ID: ${PAYMENT_RAZORPAY_KEY_ID:-}
+      PAYMENT_RAZORPAY_KEY_SECRET: ${PAYMENT_RAZORPAY_KEY_SECRET:-}
+    depends_on:
+      mysql: { condition: service_healthy }
+      config-server: { condition: service_healthy }
+      discovery-server: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8083/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  notification-service:
+    build: { context: ., args: { MODULE_PATH: services/notification-service } }
+    image: tickethub/notification-service:local
+    ports: ["8084:8084"]
+    restart: on-failure
+    environment:
+      <<: *app-env
+      DB_URL: jdbc:mysql://mysql:3306/notification_db?serverTimezone=UTC
+      KAFKA_BOOTSTRAP: kafka:9092
+      MAIL_HOST: mailpit
+      MAIL_PORT: "1025"
+    depends_on:
+      mysql: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      config-server: { condition: service_healthy }
+      discovery-server: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8084/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # ------------------------------------------------------------------ profile: failover (discovery demo)
+  booking-service-2:
+    image: tickethub/booking-service:local
+    profiles: ["failover"]
+    restart: on-failure
+    environment:
+      <<: *app-env
+      SERVER_PORT: "8082"
+      DB_URL: jdbc:mysql://mysql:3306/booking_db?serverTimezone=UTC
+      KAFKA_BOOTSTRAP: kafka:9092
+    depends_on:
+      booking-service: { condition: service_healthy }
+
+  # ------------------------------------------------------------------ profile: elk (log search)
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    profiles: ["elk"]
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+    ports: ["9200:9200"]
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.13.4
+    profiles: ["elk"]
+    volumes:
+      - ./infra/logstash/pipeline.conf:/usr/share/logstash/pipeline/logstash.conf:ro
+    ports: ["5000:5000"]
+    depends_on: [elasticsearch]
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.4
+    profiles: ["elk"]
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    ports: ["5601:5601"]
+    depends_on: [elasticsearch]
+
+volumes:
+  mysql-data:
