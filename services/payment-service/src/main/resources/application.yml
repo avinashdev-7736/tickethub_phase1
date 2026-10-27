@@ -20,6 +20,28 @@ spring:
         jwt:
           jwk-set-uri: ${JWK_SET_URI:http://localhost:8180/realms/tickethub/protocol/openid-connect/certs}
 
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:29092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        max.block.ms: 3000
+        delivery.timeout.ms: 10000
+        request.timeout.ms: 5000
+        enable.idempotence: true
+    consumer:
+      group-id: ${PAYMENT_GROUP_ID:payment-service}
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    listener:
+      observation-enabled: true
+    template:
+      observation-enabled: true
+
 eureka:
   client:
     service-url:
@@ -31,6 +53,11 @@ eureka:
 tickethub:
   internal:
     key: ${INTERNAL_API_KEY:dev-internal-key}
+  kafka:
+    topic:
+      booking-events: booking.events     # consumed: BookingRejected / BookingCancelled -> refund
+      payment-events: payment.events     # published: PaymentSucceeded / PaymentFailed / PaymentRefunded (key = bookingId)
+      retention-ms: 604800000
   clients:
     timeout-ms: 3000
     booking:
@@ -39,6 +66,14 @@ tickethub:
 # simulated = built-in controllable provider (default, used in tests/demo)
 # razorpay  = real provider SANDBOX (test keys); set the PAYMENT_RAZORPAY_* env vars
 payment:
+  group-id: ${PAYMENT_GROUP_ID:payment-service}
+  consumer:
+    retries: 4
+    initial-backoff-ms: 500
+  reconcile:
+    interval-ms: 300000     # every 5 minutes (also: POST /admin/reconciliation/run)
+    min-age-seconds: 120    # only look at payments older than this, so normal in-flight work is left alone
+    lookback-hours: 24
   provider: ${PAYMENT_PROVIDER:simulated}
   webhook:
     secret: ${PAYMENT_WEBHOOK_SECRET:dev-webhook-secret}
@@ -92,3 +127,7 @@ management:
   metrics:
     tags:
       application: ${spring.application.name}
+
+outbox:
+  relay:
+    interval-ms: 1000

@@ -7,6 +7,7 @@ import com.tickethub.payment.domain.WebhookRecord;
 import com.tickethub.payment.dto.Dtos.InternalBooking;
 import com.tickethub.payment.dto.Dtos.PaymentResponse;
 import com.tickethub.payment.provider.PaymentProvider;
+import com.tickethub.payment.provider.ProviderTimeoutException;
 import com.tickethub.payment.repo.PaymentRepository;
 import com.tickethub.payment.repo.WebhookRecordRepository;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -22,6 +23,10 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.time.Instant;
 import java.util.UUID;
 
+/**
+ * Payments. Every state change and the event that announces it commit in ONE transaction (outbox); nothing calls Booking directly.
+ * The state machine only moves forward, so duplicated, late or out-of-order provider callbacks are harmless.
+ */
 @Service
 public class PaymentService {
 
@@ -31,15 +36,17 @@ public class PaymentService {
     private final WebhookRecordRepository webhooks;
     private final BookingClient bookingClient;
     private final PaymentProvider provider;
+    private final PaymentEvents events;
     private final MeterRegistry metrics;
     private final TransactionTemplate tx;
 
     public PaymentService(PaymentRepository payments, WebhookRecordRepository webhooks, BookingClient bookingClient,
-                          PaymentProvider provider, MeterRegistry metrics, PlatformTransactionManager tm) {
+                          PaymentProvider provider, PaymentEvents events, MeterRegistry metrics, PlatformTransactionManager tm) {
         this.payments = payments;
         this.webhooks = webhooks;
         this.bookingClient = bookingClient;
         this.provider = provider;
+        this.events = events;
         this.metrics = metrics;
         this.tx = new TransactionTemplate(tm);
     }
@@ -59,8 +66,7 @@ public class PaymentService {
                 throw BusinessException.notFound("BOOKING_NOT_FOUND", "Booking not found");
             }
             if (!"PENDING_PAYMENT".equals(booking.status()) || !booking.expiresAt().isAfter(Instant.now())) {
-                throw BusinessException.conflict("BOOKING_NOT_PAYABLE",
-                        "Booking cannot be paid (status: " + booking.status() + ")");
+                throw BusinessException.conflict("BOOKING_NOT_PAYABLE", "Booking cannot be paid (status: " + booking.status() + ")");
             }
 
             Payment p = new Payment();
@@ -81,86 +87,87 @@ public class PaymentService {
             PaymentProvider.Result result;
             try {
                 result = provider.initiate(p.getId(), p.getAmount(), p.getCurrency(), bookingId); // never retried
+            } catch (ProviderTimeoutException e) {
+                // No answer is NOT a failure: the money may have moved. Park it as UNKNOWN and resolve it with the provider later.
+                log.warn("Provider timed out for payment {}: status is UNKNOWN until resolved", p.getId());
+                metrics.counter("tickethub.payment.unknown").increment();
+                result = new PaymentProvider.Result(PaymentProvider.Status.UNKNOWN, e.getReference(), "PROVIDER_TIMEOUT");
             } catch (RuntimeException e) {
                 log.error("Provider call failed for payment {}: {}", p.getId(), e.toString());
                 result = new PaymentProvider.Result(PaymentProvider.Status.FAILED, null, truncate("PROVIDER_ERROR: " + e.getMessage()));
             }
-            return finish(p.getId(), result.status(), result.reference(), result.reason());
+            return toResponse(apply(p.getId(), result.status(), result.reference(), null, result.reason()));
         } finally {
             MDC.remove("bookingId");
         }
     }
 
-    public PaymentResponse get(String id, String customerId) {
+    public PaymentResponse get(String id, String customerId, boolean admin) {
         Payment p = payments.findById(id).orElseThrow(() -> BusinessException.notFound("PAYMENT_NOT_FOUND", "Payment not found"));
-        return toResponse(owned(p, customerId));
+        return toResponse(admin ? p : owned(p, customerId));
     }
 
-    // ------------------------------------------------------------------ results (sync result, webhook, admin simulator)
-
-    /** Applies a provider outcome and tells Booking. Returns the final payment state. */
-    private PaymentResponse finish(String paymentId, PaymentProvider.Status status, String reference, String reason) {
-        Applied applied = tx.execute(s -> applyInTx(paymentId, status, reference, reason));
-        Payment p = applied.payment();
-        if (applied.changed() && p.isTerminal()) {
-            syncBooking(p);
-            p = payments.findById(paymentId).orElse(p);
+    /** Ask the provider what really happened and apply it (for UNKNOWN / PENDING / AUTHORIZED payments). Owner or ADMIN. */
+    public PaymentResponse resolve(String id, String customerId, boolean admin) {
+        Payment p = payments.findById(id).orElseThrow(() -> BusinessException.notFound("PAYMENT_NOT_FOUND", "Payment not found"));
+        if (!admin) {
+            owned(p, customerId);
         }
-        return toResponse(p);
+        return toResponse(resolveWithProvider(p));
     }
 
-    private record Applied(Payment payment, boolean changed) { }
+    /** Used by resolve() and by reconciliation. Applies the provider's answer through the forward-only state machine. */
+    public Payment resolveWithProvider(Payment p) {
+        if (p.getProviderReference() == null) {
+            log.warn("Payment {} has no provider reference; cannot be resolved by lookup", p.getId());
+            return p;
+        }
+        PaymentProvider.Result truth = provider.fetch(p.getProviderReference());
+        return apply(p.getId(), truth.status(), null, null, truth.reason());
+    }
 
-    private Applied applyInTx(String paymentId, PaymentProvider.Status status, String reference, String reason) {
+    // ------------------------------------------------------------------ the state machine
+
+    /** Applies an outcome in its own transaction. */
+    Payment apply(String paymentId, PaymentProvider.Status status, String reference, String providerPaymentId, String reason) {
+        return tx.execute(s -> applyInTx(paymentId, status, reference, providerPaymentId, reason));
+    }
+
+    /**
+     * Forward-only transition + the event announcing it, same transaction.
+     * A new status is applied only if its rank is HIGHER than the current one; otherwise it is ignored (duplicate, late, reordered).
+     */
+    Payment applyInTx(String paymentId, PaymentProvider.Status status, String reference, String providerPaymentId, String reason) {
         Payment p = payments.findForUpdate(paymentId)
                 .orElseThrow(() -> BusinessException.notFound("PAYMENT_NOT_FOUND", "Payment not found"));
-        if (p.isTerminal()) {
-            return new Applied(p, false); // late / repeated outcome: ignored (Phase 2 handles conflicting late events)
-        }
         if (reference != null && p.getProviderReference() == null) {
             p.setProviderReference(reference);
         }
-        switch (status) {
-            case SUCCESS -> {
-                p.setStatus(Payment.Status.SUCCESS);
-                p.setBookingSync(Payment.BookingSync.FAILED_TO_SYNC); // until Booking acknowledges
-                metrics.counter("tickethub.payment.success").increment();
-            }
-            case FAILED -> {
-                p.setStatus(Payment.Status.FAILED);
-                p.setFailureReason(truncate(reason));
-                p.setBookingSync(Payment.BookingSync.FAILED_TO_SYNC);
-                metrics.counter("tickethub.payment.failed").increment();
-            }
-            case PENDING -> p.setStatus(Payment.Status.PENDING);
+        if (providerPaymentId != null && p.getProviderPaymentId() == null) {
+            p.setProviderPaymentId(providerPaymentId);
         }
-        return new Applied(p, status != PaymentProvider.Status.PENDING);
-    }
-
-    /** Tell Booking the outcome. A failure here is recorded, never thrown to the customer (partial success). */
-    private void syncBooking(Payment p) {
-        String outcome = p.getStatus() == Payment.Status.SUCCESS ? "SUCCESS" : "FAILED";
-        Payment.BookingSync sync;
-        try {
-            bookingClient.sendPaymentResult(p.getBookingId(), p.getId(), outcome, p.getFailureReason());
-            sync = Payment.BookingSync.SYNCED;
-        } catch (BusinessException e) {
-            if ("BOOKING_NOT_PAYABLE".equals(e.getCode())) {
-                sync = Payment.BookingSync.REJECTED_NEEDS_REFUND;
-                log.warn("Booking {} rejected payment {} ({}): needs refund/reconciliation (Phase 2)", p.getBookingId(), p.getId(), outcome);
-            } else {
-                sync = Payment.BookingSync.FAILED_TO_SYNC;
-                log.error("Could not report payment {} to booking {}: {}", p.getId(), p.getBookingId(), e.getMessage());
-            }
-        } catch (RuntimeException e) {
-            sync = Payment.BookingSync.FAILED_TO_SYNC;
-            log.error("Could not report payment {} to booking {} (will need reconciliation): {}", p.getId(), p.getBookingId(), e.toString());
+        Payment.Status target = switch (status) {
+            case SUCCESS -> Payment.Status.SUCCESS;
+            case FAILED -> Payment.Status.FAILED;
+            case AUTHORIZED -> Payment.Status.AUTHORIZED;
+            case PENDING -> Payment.Status.PENDING;
+            case UNKNOWN -> Payment.Status.UNKNOWN;
+        };
+        if (target.rank() <= p.getStatus().rank()) {
+            metrics.counter("tickethub.payment.transition.ignored").increment();
+            log.info("Payment {}: {} ignored (already {})", p.getId(), target, p.getStatus());
+            return p;
         }
-        final Payment.BookingSync finalSync = sync;
-        if (finalSync != Payment.BookingSync.SYNCED) {
-            metrics.counter("tickethub.payment.booking.sync.failed").increment();
+        p.setStatus(target);
+        if (target == Payment.Status.SUCCESS) {
+            metrics.counter("tickethub.payment.success").increment();
+            events.succeeded(p);
+        } else if (target == Payment.Status.FAILED) {
+            p.setFailureReason(truncate(reason));
+            metrics.counter("tickethub.payment.failed").increment();
+            events.failed(p, truncate(reason));
         }
-        tx.executeWithoutResult(s -> payments.findForUpdate(p.getId()).ifPresent(x -> x.setBookingSync(finalSync)));
+        return p;
     }
 
     // ------------------------------------------------------------------ webhook
@@ -170,37 +177,34 @@ public class PaymentService {
         if (event == null) {
             return;
         }
-        Applied applied;
         try {
-            applied = tx.execute(s -> {
-                webhooks.saveAndFlush(new WebhookRecord(event.eventId())); // UNIQUE: duplicate event id fails here
-                Payment p = payments.findByProviderReference(event.providerReference()).orElse(null);
-                if (p == null) {
-                    log.warn("Webhook {} refers to unknown provider reference {}", event.eventId(), event.providerReference());
-                    return null;
-                }
-                return applyInTx(p.getId(), event.status(), null, event.reason());
+            tx.executeWithoutResult(s -> {
+                webhooks.saveAndFlush(new WebhookRecord(event.eventId())); // UNIQUE: a duplicate event id fails here
+                Payment p = payments.findByProviderReference(event.providerReference())
+                        .orElseThrow(() -> BusinessException.notFound("PAYMENT_NOT_FOUND",
+                                "No payment for provider reference (the provider will retry)"));
+                applyInTx(p.getId(), event.status(), null, event.providerPaymentId(), event.reason());
             });
         } catch (DataIntegrityViolationException e) {
-            log.info("Duplicate webhook {} ignored", event.eventId());
-            return;
-        }
-        if (applied != null && applied.changed() && applied.payment().isTerminal()) {
-            MDC.put("bookingId", applied.payment().getBookingId());
-            try {
-                syncBooking(applied.payment());
-            } finally {
-                MDC.remove("bookingId");
+            if (webhooks.existsByEventId(event.eventId())) {
+                log.info("Duplicate webhook {} ignored", event.eventId());
+                return;
             }
+            throw e;
         }
     }
 
-    /** Admin/demo helper (simulated provider only): complete a payment that is stuck in PENDING. */
+    /** Admin/demo helper (simulated provider only): complete a payment that is stuck, like a provider callback would. */
     public PaymentResponse completeManually(String paymentId, PaymentProvider.Status status, String reason) {
-        if (status == PaymentProvider.Status.PENDING) {
-            throw BusinessException.badRequest("INVALID_OUTCOME", "Outcome must be SUCCESS or FAILED");
+        if (status == PaymentProvider.Status.PENDING || status == PaymentProvider.Status.UNKNOWN) {
+            throw BusinessException.badRequest("INVALID_OUTCOME", "Outcome must be SUCCESS, FAILED or AUTHORIZED");
         }
-        return finish(paymentId, status, null, reason);
+        return toResponse(apply(paymentId, status, null, null, reason));
+    }
+
+    public String referenceOf(String paymentId) {
+        return payments.findById(paymentId)
+                .orElseThrow(() -> BusinessException.notFound("PAYMENT_NOT_FOUND", "Payment not found")).getProviderReference();
     }
 
     // ------------------------------------------------------------------ helpers
@@ -216,8 +220,8 @@ public class PaymentService {
         return s == null ? null : (s.length() > 290 ? s.substring(0, 290) : s);
     }
 
-    private PaymentResponse toResponse(Payment p) {
+    PaymentResponse toResponse(Payment p) {
         return new PaymentResponse(p.getId(), p.getBookingId(), p.getAmount(), p.getCurrency(), p.getStatus().name(),
-                p.getProvider(), p.getProviderReference(), p.getFailureReason(), p.getBookingSync().name(), p.getCreatedAt());
+                p.getProvider(), p.getProviderReference(), p.getFailureReason(), p.getRefundId(), p.getCreatedAt());
     }
 }

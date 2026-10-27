@@ -7,7 +7,7 @@ import lombok.Setter;
 
 import java.time.Instant;
 
-/** One row per BookingConfirmed event id. UNIQUE(event_id) is the duplicate-suppression mechanism. */
+/** One row per event id. UNIQUE(event_id) plus the inbox table make duplicate deliveries harmless. */
 @Entity
 @Table(name = "notification",
         uniqueConstraints = @UniqueConstraint(name = "uk_notification_event", columnNames = "event_id"),
@@ -17,7 +17,8 @@ import java.time.Instant;
 @NoArgsConstructor
 public class Notification {
 
-    public enum Status { PENDING, SENT, FAILED }
+    /** PENDING -> SENDING -> SENT | RETRYING (provider down, will retry) | FAILED (dead-lettered) | REPLAYED (rebuilt, not sent). */
+    public enum Status { PENDING, SENDING, SENT, RETRYING, FAILED, REPLAYED }
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -28,6 +29,9 @@ public class Notification {
 
     @Column(name = "booking_id", nullable = false, length = 36)
     private String bookingId;
+
+    @Column(name = "event_type", length = 40)
+    private String eventType;
 
     @Column(nullable = false, length = 200)
     private String recipient;
@@ -47,6 +51,9 @@ public class Notification {
 
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt = Instant.now();
+
+    @Column(name = "claimed_at")
+    private Instant claimedAt;
 
     @Column(name = "sent_at")
     private Instant sentAt;

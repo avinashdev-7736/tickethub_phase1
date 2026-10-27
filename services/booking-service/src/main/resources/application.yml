@@ -30,6 +30,16 @@ spring:
         delivery.timeout.ms: 10000
         request.timeout.ms: 5000
         enable.idempotence: true
+    consumer:
+      group-id: ${BOOKING_GROUP_ID:booking-service}
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    listener:
+      observation-enabled: true
+    template:
+      observation-enabled: true
 
 eureka:
   client:
@@ -44,7 +54,10 @@ tickethub:
     key: ${INTERNAL_API_KEY:dev-internal-key}
   kafka:
     topic:
-      booking-confirmed: booking-confirmed
+      booking-events: booking.events     # BookingConfirmed / BookingRejected / BookingCancelled (key = bookingId)
+      payment-events: payment.events     # PaymentSucceeded / PaymentFailed / PaymentRefunded   (key = bookingId)
+      booking-confirmed: booking.confirmed # Legacy Phase 1 publisher topic
+      retention-ms: 604800000            # 7 days: how far back a replay can go
   clients:
     timeout-ms: 2000
     event:
@@ -54,6 +67,17 @@ booking:
   expiry-minutes: 10
   scan-interval-ms: 30000
   max-seats-per-booking: 6
+  group-id: ${BOOKING_GROUP_ID:booking-service}
+  consumer:
+    retries: 4
+    initial-backoff-ms: 500
+  event:
+    # contract v2: "totalAmount" replaces "amount"; keep sending both until every consumer has migrated (scenario 13)
+    legacy-amount-field: true
+
+outbox:
+  relay:
+    interval-ms: 1000
 
 resilience4j:
   circuitbreaker:

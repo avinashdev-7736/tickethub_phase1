@@ -1,6 +1,5 @@
 package com.tickethub.booking.dto;
 
-import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
 
@@ -17,23 +16,25 @@ public final class Dtos {
     public record SeatInfo(Long seatId, String label) { }
 
     public record BookingResponse(String id, Long showId, String eventTitle, Instant showStartTime, String status,
-                                  List<SeatInfo> seats, BigDecimal amount, String currency,
-                                  Instant expiresAt, Instant createdAt) { }
+                                  String refundState, List<SeatInfo> seats, BigDecimal amount, String currency,
+                                  String seatCategory, Instant expiresAt, Instant createdAt) { }
 
     public record CreateResult(BookingResponse booking, boolean replay) { }
+
+    /** "What state is booking X in, and why?" */
+    public record TimelineEntry(Instant at, String from, String to, String reason, String eventId) { }
+
+    public record BookingTimeline(String bookingId, String status, String refundState, int eventSeq, int lastPaymentSeq,
+                                  List<TimelineEntry> entries) { }
 
     // ----- internal -----
     public record ReservedSeat(Long seatId, String state) { }
 
     public record InternalBooking(String id, String customerId, String status, BigDecimal amount, String currency,
-                                  Instant expiresAt, Long showId) { }
-
-    public enum PaymentOutcome { SUCCESS, FAILED }
-
-    public record PaymentResultRequest(@NotBlank String paymentId, @NotNull PaymentOutcome status, String reason) { }
+                                  Instant expiresAt, Long showId, String refundState) { }
 
     // ----- response from Event/Show internal API -----
-    public record ShowSeat(Long id, String label) { }
+    public record ShowSeat(Long id, String label, String type) { }
 
     public record ShowInfo(Long showId, String status, String eventTitle, Instant startTime,
                            BigDecimal price, String currency, List<ShowSeat> seats) { }

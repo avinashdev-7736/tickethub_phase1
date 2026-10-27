@@ -10,20 +10,24 @@ import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Controllable fake provider. Behaviour can be switched at runtime (ADMIN endpoint) to demonstrate
- * success, failure, slow payment and "stuck pending" (timeout) scenarios.
+ * Controllable fake provider that also keeps its own "truth" per reference, like a real provider would, so that
+ * reconciliation and timeout recovery can be demonstrated.
+ * Modes: SUCCESS, FAILURE, RANDOM, PENDING (stuck),
+ *        TIMEOUT_CAPTURED (money taken, answer lost), TIMEOUT_NOT_CAPTURED (nothing happened, answer lost).
  * Signed callbacks: header X-Simulator-Signature = HMAC-SHA256(body, payment.webhook.secret), body
- * {"eventId":"..","providerReference":"..","status":"SUCCESS|FAILED","reason":".."}.
+ * {"eventId":"..","providerReference":"..","providerPaymentId":"..","status":"SUCCESS|FAILED|AUTHORIZED","reason":".."}.
  */
 @Component
 @ConditionalOnProperty(name = "payment.provider", havingValue = "simulated", matchIfMissing = true)
 public class SimulatedPaymentProvider implements PaymentProvider {
 
-    public enum Mode { SUCCESS, FAILURE, RANDOM, PENDING }
+    public enum Mode { SUCCESS, FAILURE, RANDOM, PENDING, TIMEOUT_CAPTURED, TIMEOUT_NOT_CAPTURED }
 
     public static final String SIGNATURE_HEADER = "X-Simulator-Signature";
 
@@ -32,6 +36,8 @@ public class SimulatedPaymentProvider implements PaymentProvider {
     private final double failureRate;
     private final String webhookSecret;
     private final ObjectMapper mapper;
+    private final Map<String, Status> truth = new ConcurrentHashMap<>();
+    private final Map<String, String> refunds = new ConcurrentHashMap<>();
 
     public SimulatedPaymentProvider(@Value("${payment.simulator.mode:SUCCESS}") Mode mode,
                                     @Value("${payment.simulator.delay-ms:0}") long delayMs,
@@ -54,6 +60,15 @@ public class SimulatedPaymentProvider implements PaymentProvider {
         return mode.get();
     }
 
+    /** Test/demo helper: the provider captured the money but no callback was ever delivered (reconciliation must find it). */
+    public void silentCapture(String reference) {
+        truth.put(reference, Status.SUCCESS);
+    }
+
+    public int refundCount() {
+        return refunds.size();
+    }
+
     @Override
     public String name() {
         return "simulated";
@@ -69,14 +84,49 @@ public class SimulatedPaymentProvider implements PaymentProvider {
             }
         }
         String ref = "sim_" + paymentId;
-        return switch (mode.get()) {
-            case SUCCESS -> new Result(Status.SUCCESS, ref, null);
-            case FAILURE -> new Result(Status.FAILED, ref, "SIMULATED_DECLINE");
-            case PENDING -> new Result(Status.PENDING, ref, null);
-            case RANDOM -> ThreadLocalRandom.current().nextDouble() < failureRate
-                    ? new Result(Status.FAILED, ref, "SIMULATED_RANDOM_DECLINE")
-                    : new Result(Status.SUCCESS, ref, null);
-        };
+        switch (mode.get()) {
+            case SUCCESS -> {
+                truth.put(ref, Status.SUCCESS);
+                return new Result(Status.SUCCESS, ref, null);
+            }
+            case FAILURE -> {
+                truth.put(ref, Status.FAILED);
+                return new Result(Status.FAILED, ref, "SIMULATED_DECLINE");
+            }
+            case PENDING -> {
+                truth.put(ref, Status.PENDING);
+                return new Result(Status.PENDING, ref, null);
+            }
+            case TIMEOUT_CAPTURED -> {
+                truth.put(ref, Status.SUCCESS);
+                throw new ProviderTimeoutException(ref, "simulated timeout (payment WAS captured)", null);
+            }
+            case TIMEOUT_NOT_CAPTURED -> {
+                truth.put(ref, Status.FAILED);
+                throw new ProviderTimeoutException(ref, "simulated timeout (payment was NOT captured)", null);
+            }
+            default -> {
+                if (ThreadLocalRandom.current().nextDouble() < failureRate) {
+                    truth.put(ref, Status.FAILED);
+                    return new Result(Status.FAILED, ref, "SIMULATED_RANDOM_DECLINE");
+                }
+                truth.put(ref, Status.SUCCESS);
+                return new Result(Status.SUCCESS, ref, null);
+            }
+        }
+    }
+
+    @Override
+    public Result fetch(String providerReference) {
+        Status s = truth.getOrDefault(providerReference, Status.UNKNOWN);
+        return new Result(s, providerReference, null);
+    }
+
+    @Override
+    public RefundResult refund(String paymentId, String providerReference, String providerPaymentId, BigDecimal amount, String currency) {
+        // idempotent by payment id: asking twice never refunds twice
+        String refundId = refunds.computeIfAbsent(paymentId, id -> "rf_" + id);
+        return new RefundResult(refundId);
     }
 
     @Override
@@ -93,8 +143,12 @@ public class SimulatedPaymentProvider implements PaymentProvider {
             if (eventId == null || ref == null || status == null) {
                 throw BusinessException.badRequest("INVALID_WEBHOOK", "eventId, providerReference and status are required");
             }
-            Status s = "SUCCESS".equalsIgnoreCase(status) ? Status.SUCCESS : Status.FAILED;
-            return new WebhookEvent(eventId, ref, s, text(n, "reason"));
+            Status s = switch (status.toUpperCase()) {
+                case "SUCCESS" -> Status.SUCCESS;
+                case "AUTHORIZED" -> Status.AUTHORIZED;
+                default -> Status.FAILED;
+            };
+            return new WebhookEvent(eventId, ref, text(n, "providerPaymentId"), s, text(n, "reason"));
         } catch (BusinessException e) {
             throw e;
         } catch (Exception e) {

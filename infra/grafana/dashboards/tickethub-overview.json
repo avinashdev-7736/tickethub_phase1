@@ -231,6 +231,139 @@
           "legendFormat": "{{application}} {{name}} {{state}}"
         }
       ]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Kafka consumer lag (max, per service)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (application) (kafka_consumer_fetch_manager_records_lag_max)",
+          "legendFormat": "{{application}}"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Outbox: events waiting to reach Kafka",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "tickethub_outbox_pending",
+          "legendFormat": "{{application}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (application) (increase(tickethub_outbox_publish_failed_total[1m]))",
+          "legendFormat": "publish failures/min {{application}}"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Dead letters and email retries (per min)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(tickethub_notification_deadlettered_total[1m]))",
+          "legendFormat": "dead-lettered"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(increase(tickethub_notification_retrying_total[1m]))",
+          "legendFormat": "email retrying"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(increase(tickethub_notification_duplicate_total[1m]))",
+          "legendFormat": "duplicates ignored"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(increase(tickethub_notification_stale_total[1m]))",
+          "legendFormat": "stale ignored"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Saga: rejections, refunds, stale/duplicate events (per min)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(tickethub_booking_rejected_total[1m]))",
+          "legendFormat": "bookings rejected"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(increase(tickethub_refund_completed_total[1m]))",
+          "legendFormat": "refunds completed"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(increase(tickethub_refund_failed_total[1m]))",
+          "legendFormat": "refunds failed"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(increase(tickethub_saga_stale_total[1m]))",
+          "legendFormat": "stale ignored"
+        },
+        {
+          "refId": "E",
+          "expr": "sum(increase(tickethub_saga_duplicate_total[1m]))",
+          "legendFormat": "duplicates ignored"
+        },
+        {
+          "refId": "F",
+          "expr": "sum(increase(tickethub_payment_unknown_total[1m]))",
+          "legendFormat": "payments UNKNOWN"
+        }
+      ]
     }
   ],
   "tags": [
