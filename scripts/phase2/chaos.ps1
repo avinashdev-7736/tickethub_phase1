@@ -9,28 +9,31 @@ $MAIL = "http://localhost:8025"
 $SECRET = if ($env:PAYMENT_WEBHOOK_SECRET) { $env:PAYMENT_WEBHOOK_SECRET } else { "dev-webhook-secret" }
 
 function Token($u, $p) { (Invoke-RestMethod -Method Post -Uri $KC -Body @{ client_id = "tickethub-web"; grant_type = "password"; username = $u; password = $p }).access_token }
-function H($t) { @{ Authorization = "Bearer $t" } }
+function AuthHeaders($t) { @{ Authorization = "Bearer $t" } }
 function Json($o) { $o | ConvertTo-Json -Depth 5 }
-function Mode($mode) { Invoke-RestMethod -Method Post -Uri "$GW/payments/simulator/mode?mode=$mode" -Headers (H $script:admin) | Out-Null; Write-Host "simulator mode: $mode" }
+function Mode($mode) { Invoke-RestMethod -Method Post -Uri "$GW/payments/simulator/mode?mode=$mode" -Headers (AuthHeaders $script:admin) | Out-Null; Write-Host "simulator mode: $mode" }
 function Book($token) {
     $show = (Invoke-RestMethod "$GW/shows").content[0].id
-    $seat = (Invoke-RestMethod "$GW/shows/$show/seats" | Where-Object { $_.status -eq "AVAILABLE" } | Select-Object -First 1).seatId
-    $b = Invoke-RestMethod -Method Post -Uri "$GW/bookings" -Headers (H $token) -ContentType "application/json" -Body (Json @{ showId = $show; seatIds = @($seat) })
+    $seats = Invoke-RestMethod "$GW/shows/$show/seats"
+    $availableSeat = $seats | Where-Object { $_.status -eq "AVAILABLE" } | Select-Object -First 1
+    if (-not $availableSeat) { throw "No available seats for show $show" }
+    $seat = $availableSeat.seatId
+    $b = Invoke-RestMethod -Method Post -Uri "$GW/bookings" -Headers (AuthHeaders $token) -ContentType "application/json" -Body (Json @{ showId = $show; seatIds = @($seat) })
     Write-Host "booking $($b.id) created (seat $seat)"; $b
 }
 function Pay($token, $bookingId) {
-    $p = Invoke-RestMethod -Method Post -Uri "$GW/payments" -Headers (H $token) -ContentType "application/json" -Body (Json @{ bookingId = $bookingId })
+    $p = Invoke-RestMethod -Method Post -Uri "$GW/payments" -Headers (AuthHeaders $token) -ContentType "application/json" -Body (Json @{ bookingId = $bookingId })
     Write-Host "payment $($p.id) -> $($p.status)"; $p
 }
 function Wait-Booking($token, $id, $status, $seconds = 60) {
     for ($i = 0; $i -lt $seconds; $i++) {
-        $b = Invoke-RestMethod "$GW/bookings/$id" -Headers (H $token)
+        $b = Invoke-RestMethod "$GW/bookings/$id" -Headers (AuthHeaders $token)
         if ($b.status -eq $status) { Write-Host "booking is $status (refund: $($b.refundState))"; return $b }
         Start-Sleep -Seconds 1
     }
-    Write-Warning "booking did not reach $status within $seconds s"; Invoke-RestMethod "$GW/bookings/$id" -Headers (H $token)
+    Write-Warning "booking did not reach $status within $seconds s"; Invoke-RestMethod "$GW/bookings/$id" -Headers (AuthHeaders $token)
 }
-function Timeline($token, $id) { (Invoke-RestMethod "$GW/bookings/$id/timeline" -Headers (H $token)).entries | Format-Table at, from, to, reason -AutoSize }
+function Timeline($token, $id) { (Invoke-RestMethod "$GW/bookings/$id/timeline" -Headers (AuthHeaders $token)).entries | Format-Table at, from, to, reason -AutoSize }
 function Mails() { (Invoke-RestMethod "$MAIL/api/v1/messages").total }
 function Sign($body) { $h = New-Object System.Security.Cryptography.HMACSHA256; $h.Key = [Text.Encoding]::UTF8.GetBytes($SECRET); -join ($h.ComputeHash([Text.Encoding]::UTF8.GetBytes($body)) | ForEach-Object { $_.ToString("x2") }) }
 function Webhook($ref, $status, $eventId) {
@@ -47,18 +50,18 @@ Mode "SUCCESS"
 switch ($Drill) {
     "cancel-after-pay" {
         $b = Book $cust; Pay $cust $b.id | Out-Null; Wait-Booking $cust $b.id "CONFIRMED" | Out-Null
-        Invoke-RestMethod -Method Post -Uri "$GW/bookings/$($b.id)/cancel" -Headers (H $cust) | Out-Null
+        Invoke-RestMethod -Method Post -Uri "$GW/bookings/$($b.id)/cancel" -Headers (AuthHeaders $cust) | Out-Null
         Wait-Booking $cust $b.id "CANCELLED" | Out-Null; Timeline $cust $b.id
         Write-Host "EXPECT: CANCELLED with refundState REFUNDED; seat available again."
     }
     "late-payment" {
         Mode "PENDING"
         $b = Book $cust; $p = Pay $cust $b.id
-        Invoke-RestMethod -Method Post -Uri "$GW/bookings/$($b.id)/cancel" -Headers (H $cust) | Out-Null
+        Invoke-RestMethod -Method Post -Uri "$GW/bookings/$($b.id)/cancel" -Headers (AuthHeaders $cust) | Out-Null
         Write-Host "booking cancelled while the payment was still pending; now the provider reports success (too late)"
-        Invoke-RestMethod -Method Post -Uri "$GW/payments/simulator/complete?paymentId=$($p.id)&outcome=SUCCESS" -Headers (H $script:admin) | Out-Null
+        Invoke-RestMethod -Method Post -Uri "$GW/payments/simulator/complete?paymentId=$($p.id)&outcome=SUCCESS" -Headers (AuthHeaders $script:admin) | Out-Null
         Wait-Booking $cust $b.id "REJECTED" | Out-Null; Start-Sleep -Seconds 3
-        (Invoke-RestMethod "$GW/bookings/$($b.id)" -Headers (H $cust)) | Select-Object status, refundState | Format-List; Timeline $cust $b.id
+        (Invoke-RestMethod "$GW/bookings/$($b.id)" -Headers (AuthHeaders $cust)) | Select-Object status, refundState | Format-List; Timeline $cust $b.id
         Write-Host "EXPECT: REJECTED with refundState REFUNDED (money returned), timeline explains why."
     }
     "kafka-down" {
@@ -78,18 +81,19 @@ switch ($Drill) {
     }
     "duplicate-webhook" {
         Mode "PENDING"; $b = Book $cust; $p = Pay $cust $b.id
-        Webhook $p.providerReference "SUCCESS" "dup-1"; Webhook $p.providerReference "SUCCESS" "dup-1"
-        Webhook $p.providerReference "AUTHORIZED" "late-auth"; Webhook $p.providerReference "FAILED" "late-fail"
+        $duplicateEventId = [guid]::NewGuid().ToString()
+        Webhook $p.providerReference "SUCCESS" $duplicateEventId; Webhook $p.providerReference "SUCCESS" $duplicateEventId
+        Webhook $p.providerReference "AUTHORIZED" ([guid]::NewGuid().ToString()); Webhook $p.providerReference "FAILED" ([guid]::NewGuid().ToString())
         Wait-Booking $cust $b.id "CONFIRMED" | Out-Null; Start-Sleep -Seconds 4
         Write-Host "emails before: $mailsBefore, after: $(Mails)"; Timeline $cust $b.id
         Write-Host "EXPECT: CONFIRMED once, one email, the late AUTHORIZED/FAILED callbacks ignored."
     }
     "silent-capture" {
         Mode "PENDING"; $b = Book $cust; $p = Pay $cust $b.id
-        Invoke-RestMethod -Method Post -Uri "$GW/payments/simulator/silent-capture?paymentId=$($p.id)" -Headers (H $script:admin) | Out-Null
+        Invoke-RestMethod -Method Post -Uri "$GW/payments/simulator/silent-capture?paymentId=$($p.id)" -Headers (AuthHeaders $script:admin) | Out-Null
         Write-Host "provider captured the money, but no callback was sent. Booking stays PENDING_PAYMENT."
         Write-Host "Run reconciliation on payment-service (needs min-age: set payment.reconcile.min-age-seconds=0 or wait 2 minutes):"
-        $r = Invoke-RestMethod -Method Post -Uri "http://localhost:8083/admin/reconciliation/run" -Headers (H $script:admin); Json $r
+        $r = Invoke-RestMethod -Method Post -Uri "http://localhost:8083/admin/reconciliation/run" -Headers (AuthHeaders $script:admin); Json $r
         Wait-Booking $cust $b.id "CONFIRMED" | Out-Null
         Write-Host "EXPECT: finding UNRESOLVED_RESOLVED (FIXED) and the booking CONFIRMED."
     }

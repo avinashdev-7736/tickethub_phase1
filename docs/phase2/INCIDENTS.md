@@ -1,7 +1,7 @@
 # Incident notes (scenario 14)
 
-How to use this file: run each drill (`.\scripts\phase2\chaos.ps1 <drill>`), look at Kafka UI / Grafana / Jaeger / Kibana (search `bookingId`), and fill in **Observed**.
-"Expected" below is what the design should produce; **it has not been observed yet - the code was written without being able to run the stack.** If what you observe differs, that is a bug: write it down and fix it.
+How to use this file: run each drill (`.\scripts\phase2\chaos.ps1 <drill>`), look at Kafka UI / Grafana / Jaeger / Kibana (search `bookingId`), and record actual results in **Observed**.
+"Expected" below is what the design should produce. If observations differ, write down the discrepancy and fix it.
 
 Template: Trigger - Symptom - Where to look - Cause - Fix - Prevention - Observed.
 
@@ -31,7 +31,7 @@ Template: Trigger - Symptom - Where to look - Cause - Fix - Prevention - Observe
 - **Cause:** providers retry and reorder callbacks.
 - **Fix:** none needed.
 - **Prevention:** webhook event-id dedupe + forward-only state machine.
-- **Observed:** ________
+- **Observed:** Passed on 2026-10-27. Booking `dc9070ca-9960-4a1c-a9b9-743a7f50b581` reached CONFIRMED once after a duplicate SUCCESS and late AUTHORIZED/FAILED callbacks; its timeline has one confirmation and Mailpit recorded exactly one new confirmation email.
 
 ## 4. Payment arrives after the booking was cancelled (`late-payment`)
 - **Trigger:** payment stuck PENDING, booking cancelled, provider then reports SUCCESS.
@@ -45,7 +45,7 @@ Template: Trigger - Symptom - Where to look - Cause - Fix - Prevention - Observe
 ## 5. Customer cancels after paying (`cancel-after-pay`)
 - **Expected symptom:** seats free at once, booking CANCELLING, then CANCELLED with refundState REFUNDED; cancellation email.
 - **Prevention:** `BookingCancelled` -> refund; seats are released first so the customer-visible action is instant.
-- **Observed:** ________
+- **Observed:** Passed on 2026-10-27. Booking `b50997d8-1941-4fa9-8274-bcdb58abe47a` moved CONFIRMED -> CANCELLING -> CANCELLED with refundState REFUNDED; Mailpit received confirmation and cancellation emails, and seat B1 was AVAILABLE afterward.
 
 ## 6. The provider captured money but no callback ever came (`silent-capture`)
 - **Trigger:** `POST /payments/simulator/silent-capture`, then `POST :8083/admin/reconciliation/run`.
