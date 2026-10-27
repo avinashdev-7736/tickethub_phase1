@@ -10,6 +10,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
 
 import java.math.BigDecimal;
@@ -18,10 +19,10 @@ import java.util.Base64;
 import java.util.Map;
 
 /**
- * Razorpay SANDBOX integration (use TEST keys only). Creates an order and returns PENDING; the final result
- * arrives through the signed webhook (payment.captured / payment.failed).
- * NOTE: written against the public Razorpay REST docs but not exercised against the live sandbox from the build
- * environment - verify with your own test keys (see docs/DEPLOYMENT.md).
+ * Razorpay SANDBOX integration (use TEST keys only). Creates an order and returns PENDING; the final result arrives through the
+ * signed webhook (payment.authorized / payment.captured / payment.failed). A timeout calling Razorpay becomes
+ * {@link ProviderTimeoutException} so the payment is UNKNOWN and gets resolved by fetch/reconciliation, never guessed as FAILED.
+ * NOTE: written against the public Razorpay REST docs but NOT exercised against the live sandbox from the build environment.
  */
 @Component
 @ConditionalOnProperty(name = "payment.provider", havingValue = "razorpay")
@@ -61,13 +62,56 @@ public class RazorpayPaymentProvider implements PaymentProvider {
                 "currency", currency,
                 "receipt", paymentId,
                 "notes", Map.of("bookingId", bookingId, "paymentId", paymentId));
-        JsonNode response = rest.post().uri("/v1/orders")
-                .contentType(MediaType.APPLICATION_JSON).body(body)
+        try {
+            JsonNode response = rest.post().uri("/v1/orders")
+                    .contentType(MediaType.APPLICATION_JSON).body(body)
+                    .retrieve().body(JsonNode.class);
+            if (response == null || response.get("id") == null) {
+                return new Result(Status.FAILED, null, "PROVIDER_BAD_RESPONSE");
+            }
+            return new Result(Status.PENDING, response.get("id").asText(), null);
+        } catch (ResourceAccessException e) {
+            throw new ProviderTimeoutException(null, "Razorpay did not answer: " + e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public Result fetch(String providerReference) {
+        try {
+            JsonNode payments = rest.get().uri("/v1/orders/{id}/payments", providerReference).retrieve().body(JsonNode.class);
+            Status best = Status.PENDING;
+            if (payments != null && payments.path("items").isArray()) {
+                for (JsonNode p : payments.path("items")) {
+                    String st = p.path("status").asText("");
+                    if ("captured".equals(st)) {
+                        return new Result(Status.SUCCESS, providerReference, null);
+                    }
+                    if ("authorized".equals(st)) {
+                        best = Status.AUTHORIZED;
+                    } else if ("failed".equals(st) && best == Status.PENDING) {
+                        best = Status.FAILED;
+                    }
+                }
+            }
+            return new Result(best, providerReference, null);
+        } catch (ResourceAccessException e) {
+            return new Result(Status.UNKNOWN, providerReference, "provider unreachable");
+        }
+    }
+
+    @Override
+    public RefundResult refund(String paymentId, String providerReference, String providerPaymentId, BigDecimal amount, String currency) {
+        if (providerPaymentId == null) {
+            throw new IllegalStateException("Cannot refund yet: the provider payment id is not known (no callback received)");
+        }
+        JsonNode response = rest.post().uri("/v1/payments/{id}/refund", providerPaymentId)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("amount", amount.movePointRight(2).longValueExact(), "receipt", paymentId))
                 .retrieve().body(JsonNode.class);
         if (response == null || response.get("id") == null) {
-            return new Result(Status.FAILED, null, "PROVIDER_BAD_RESPONSE");
+            throw new IllegalStateException("Provider returned no refund id");
         }
-        return new Result(Status.PENDING, response.get("id").asText(), null);
+        return new RefundResult(response.get("id").asText());
     }
 
     @Override
@@ -80,12 +124,13 @@ public class RazorpayPaymentProvider implements PaymentProvider {
             JsonNode root = mapper.readTree(rawBody);
             String event = root.path("event").asText("");
             Status status;
-            if ("payment.captured".equals(event)) {
-                status = Status.SUCCESS;
-            } else if ("payment.failed".equals(event)) {
-                status = Status.FAILED;
-            } else {
-                return null; // other event types are ignored
+            switch (event) {
+                case "payment.authorized" -> status = Status.AUTHORIZED;
+                case "payment.captured" -> status = Status.SUCCESS;
+                case "payment.failed" -> status = Status.FAILED;
+                default -> {
+                    return null; // other event types are ignored
+                }
             }
             JsonNode entity = root.path("payload").path("payment").path("entity");
             String orderId = entity.path("order_id").asText(null);
@@ -96,7 +141,7 @@ public class RazorpayPaymentProvider implements PaymentProvider {
             if (eventId == null || eventId.isBlank()) {
                 eventId = Hmac.sha256Hex("dedupe", rawBody); // fallback: identical body = same event
             }
-            return new WebhookEvent(eventId, orderId, status, entity.path("error_description").asText(null));
+            return new WebhookEvent(eventId, orderId, entity.path("id").asText(null), status, entity.path("error_description").asText(null));
         } catch (BusinessException e) {
             throw e;
         } catch (Exception e) {

@@ -23,19 +23,19 @@ GW = http://localhost:8080. Get tokens as in the README.
 | 15 | GET /bookings/{id} | `BookingController` | other customer -> 404 |
 | 16 | cancel booking | `BookingService.cancel` | seats AVAILABLE again; CONFIRMED -> 409 |
 | 17 | reserved-seats (internal) | `InternalBookingController` | via gateway -> 401/403/404 (never routed); with `X-Internal-Key` directly on :8082 -> 200 |
-| 18 | payment-result (internal) | `BookingService.applyPaymentResult` | SUCCESS -> CONFIRMED + BOOKED; FAILED -> PAYMENT_FAILED + released; duplicate = no-op |
+| 18 | payment result -> booking | **Phase 2:** `BookingSagaService` consuming `PaymentSucceeded/Failed` (the REST callback was removed) | SUCCESS -> CONFIRMED + BOOKED; FAILED -> PAYMENT_FAILED + released; duplicate event = no-op (`BookingFlowTest`) |
 | 19 | expiry job | `ExpiryJob` | set `booking.expiry-minutes: 1`, book, wait ~1.5 min -> EXPIRED, seats free |
 | 20 | POST /payments | `PaymentService.initiate` | amount equals booking amount; foreign/expired booking -> 404/409 (`PaymentFlowTest`) |
 | 21 | GET /payments/{id} | `PaymentController` | owner only |
 | 22 | webhook | `PaymentService.handleWebhook` | bad signature -> 401; duplicate -> applied once (`PaymentFlowTest`); real sandbox: DEPLOYMENT.md section 5 |
-| 23 | Notification consumer | `NotificationService` | email in Mailpit; duplicate event -> one email; SMTP down -> FAILED, booking unaffected (`NotificationFlowTest`) |
+| 23 | Notification consumer | `BookingEventsConsumer` + `NotificationService` (Phase 2: retry topics, DLT, inbox) | email in Mailpit; duplicate event -> one email; SMTP down -> FAILED, booking unaffected (`NotificationFlowTest`) |
 | 24 | API Gateway | `platform/api-gateway` | all calls above work through :8080; `/internal/...` -> 401/403 |
 | 25 | Service discovery | `platform/discovery-server` | Eureka dashboard lists services; failover profile demo (README) |
 
 ## Event
 | # | Item | Code | How to verify |
 |---|---|---|---|
-| 1 | BookingConfirmed | `BookingEventPublisher` -> `BookingConfirmedConsumer` | `docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic booking-confirmed --from-beginning`; keyed by bookingId; exactly one message per confirmed booking |
+| 1 | BookingConfirmed | outbox -> `OutboxRelay` -> topic `booking.events` -> `BookingEventsConsumer` | `docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic booking.events --from-beginning --property print.key=true`; keyed by bookingId; one `BookingConfirmed` per confirmed booking |
 
 ## Cross-cutting
 | # | Check | How to verify |
@@ -53,3 +53,7 @@ GW = http://localhost:8080. Get tokens as in the README.
 - `PaymentFlowTest`: amount from booking, failure, booking-down sync failure, repeat initiation, foreign/expired booking, signed + duplicate webhook, bad signature
 - `NotificationFlowTest`: send, duplicate suppression, SMTP failure recorded, malformed message dropped
 - `ShowServiceTest`: show open rules
+
+
+## Phase 2
+Evidence for the Phase 2 scenarios (outbox, inbox, DLT, saga, refunds, reconciliation, replay) is in `docs/phase2/README.md` (table: scenario -> code -> test/drill) and `docs/phase2/INCIDENTS.md`.

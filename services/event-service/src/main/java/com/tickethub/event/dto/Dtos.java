@@ -52,7 +52,7 @@ public final class Dtos {
     public record SeatMapEntry(Long seatId, String row, int number, String label, String type, String status) { }
 
     // ----- internal (service to service) -----
-    public record InternalSeat(Long id, String label) { }
+    public record InternalSeat(Long id, String label, String type) { }
 
     public record InternalShow(Long showId, String status, String eventTitle, Instant startTime,
                                BigDecimal price, String currency, List<InternalSeat> seats) { }

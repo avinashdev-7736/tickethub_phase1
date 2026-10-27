@@ -10,26 +10,39 @@
 | 5 | Amount = show price x seats, **snapshotted on the booking**; Payment copies it from Booking, never from the client | Prevents price tampering and later price changes altering a booking | Client supplies amount |
 | 6 | Booking `expiresAt` + scheduled expiry job; row lock + re-check makes it safe with several instances | Seats are never held forever | TTL cache |
 | 7 | Idempotency: `Idempotency-Key` unique per customer on bookings; one payment per booking; webhook events de-duplicated by event id; notifications de-duplicated by event id | Retries and duplicate deliveries are normal | - |
-| 8 | Payment -> Booking is a **synchronous internal call** with timeout, bounded retry (safe because Booking treats repeats as no-ops) and circuit breaker; outcome recorded in `payment.booking_sync` | Simple, visible; failure never loses the fact that Booking was not told | Event-driven result (Phase 2 saga) |
+| 8 | ~~Payment -> Booking synchronous callback~~ **Replaced in Phase 2** by events: Payment publishes `PaymentSucceeded/Failed` (outbox), Booking consumes with an inbox | A callback can fail halfway (payment done, booking never told); events + outbox + reconciliation cannot lose the fact | Orchestrator (see `docs/phase2/SAGA.md`) |
 | 9 | `/internal/**` guarded by a shared key and never routed by the gateway | Simple service-to-service trust boundary | mTLS / client-credentials tokens (Phase 2 hardening) |
 | 10 | Payment provider behind an interface; simulated provider switchable at runtime; Razorpay sandbox implementation | Deterministic failure testing + real integration | Provider SDK in business code |
-| 11 | Kafka event published **after** commit, best effort, no outbox | Phase 1 scope | Transactional outbox (Phase 2) |
+| 11 | ~~Best-effort publish after commit~~ **Replaced in Phase 2** by a transactional outbox + relay in Booking and Payment | The business change and its event commit together; a Kafka outage delays an event but cannot lose it | Dual write / CDC |
 | 12 | Small `tickethub-common` jar: error format, JWT role mapping, correlation id, internal key filter | Identical behaviour in every service | Copy-paste per service. Trade-off: shared library coupling; it holds no business code |
 | 13 | `ddl-auto=update` for schema | Speed for Phase 1 | Flyway migrations (should come first in Phase 2) |
 
-## Known Phase 1 gaps (deliberate or deferred - say these out loud in the demo)
-1. **Event lost if Kafka is down at confirmation** - booking stays CONFIRMED, no email. Fix: outbox (Phase 2).
-2. **Paid after expiry / after cancel** - Booking refuses (409); payment is marked `REJECTED_NEEDS_REFUND`. Fix: refunds + reconciliation (Phase 2).
-3. **Booking not told about the payment** (Booking down) - payment marked `FAILED_TO_SYNC`; booking stays PENDING_PAYMENT until it expires. Fix: reconciliation job (Phase 2).
-4. **No automatic SOLD_OUT / COMPLETED show states.**
-5. **No rate limiting** at the gateway (needs Redis).
-6. **Failed notifications are not retried**; no DLT / replay (Phase 2).
-7. `/actuator/**` is open for convenience; restrict at the network level or add auth before real deployment.
-8. Keycloak runs in `start-dev` with an imported realm (wildcard redirect URIs, HTTP) - local only.
-9. Razorpay provider is written against public docs and was **not run against the live sandbox**.
-10. Nothing in this repository has been compiled or executed by the author of this code (see README "Honest status").
+## Phase 2 decisions
+| # | Decision | Why |
+|---|---|---|
+| 14 | **Choreography** (event reactions), with a saga log + `/timeline` for visibility | 3 services, short flow; see `docs/phase2/SAGA.md` for when to switch to orchestration |
+| 15 | One topic per producing service (`booking.events`, `payment.events`), key = bookingId, plus `aggregateVersion` | Keeps one booking's events in one partition (order) and lets consumers detect stale events |
+| 16 | **At-least-once everywhere + inbox** (unique event id, same transaction as the effect) | Exactly-once delivery does not exist; exactly-once *effect* does |
+| 17 | External side effects (email, refund) use an **atomic claim** (`PENDING->SENDING`, `SUCCESS->REFUNDING`) | Two workers can never both send/refund; a crashed claim is retaken after a timeout (we prefer a rare duplicate email over a lost one) |
+| 18 | Payment states are **forward-only by rank**; a provider timeout is `UNKNOWN`, never `FAILED` | Late/duplicate/reordered callbacks cannot corrupt state; we never declare a failure we cannot prove |
+| 19 | `FAILED -> SUCCESS` is allowed | The provider capturing money is the truth; Booking then rejects + refunds if it can no longer confirm |
+| 20 | Reconciliation fixes only what the provider proves; everything else is **FLAGGED** | We never guess about money |
+| 21 | Email: non-blocking retry topics + circuit breaker + rate limiter; bad data goes straight to the DLT | One slow/dead provider must not block the stream; bad data can never succeed on retry |
+| 22 | Replay = new consumer group + own database + `replay-mode` (no email) | Rebuild state without side effects; limited by topic retention (7 days) |
+| 23 | Contract v2: additive field + dual field during a rename (`booking.event.legacy-amount-field`) | Producers and consumers deploy independently |
+
+## Known gaps (after Phase 2)
+1. **Razorpay refund / fetch / timeout paths are untested against the live sandbox** (the simulated provider covers the logic). A refund needs the provider payment id from a callback.
+2. **No saga timeout**: a payment stuck PENDING for hours is handled by booking expiry (seats) and reconciliation (money), not by an explicit timer.
+3. **Dead letters of Booking and Payment** are visible in Kafka UI only (no admin replay API); Notification has one.
+4. **A SENDING email whose instance crashed** may be sent twice after the claim timeout (5 minutes) - by choice.
+5. **Single broker, replication factor 1** (local). Production needs replication >= 3 and `min.insync.replicas`.
+6. **No automatic SOLD_OUT / COMPLETED show states; no gateway rate limiting (needs Redis).**
+7. `/actuator/**` is open for convenience; admin APIs are on service ports, not the gateway. Restrict at the network level before real deployment.
+8. Keycloak runs in `start-dev` (local only). Schema is managed by `ddl-auto=update`: introduce Flyway before production, and reset volumes (`docker compose down -v`) when upgrading from Phase 1.
+9. The Kafka wiring (retry topics, DLTs, groups, relay against a real broker) and the compose profiles are verified only by the drills in `docs/phase2/INCIDENTS.md`, not by automated tests.
 
 ## Questions the source documents leave open (resolved here)
 - Auth: Keycloak vs Auth Service -> Keycloak (decision 1).
 - Where does Notification get the recipient email? -> BookingConfirmed carries `recipientEmail`, taken from the JWT `email` claim when the booking is created (token without email -> 400).
-- Payment -> Booking contract -> `POST /internal/bookings/{id}/payment-result` (decision 8).
+- Payment -> Booking contract -> events `PaymentSucceeded` / `PaymentFailed` (decision 8, Phase 2; the Phase 1 REST callback was removed).

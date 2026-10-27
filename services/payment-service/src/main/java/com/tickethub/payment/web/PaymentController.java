@@ -7,6 +7,7 @@ import com.tickethub.payment.service.PaymentService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
+import org.springframework.security.core.Authentication;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.*;
@@ -30,8 +31,14 @@ public class PaymentController {
     }
 
     @GetMapping("/{id}")
-    public PaymentResponse get(@PathVariable String id, @AuthenticationPrincipal Jwt jwt) {
-        return service.get(id, CurrentUser.id(jwt));
+    public PaymentResponse get(@PathVariable String id, @AuthenticationPrincipal Jwt jwt, Authentication auth) {
+        return service.get(id, CurrentUser.id(jwt), CurrentUser.isAdmin(auth));
+    }
+
+    /** For a payment stuck in UNKNOWN / PENDING / AUTHORIZED: ask the provider what really happened. Owner or ADMIN. */
+    @PostMapping("/{id}/resolve")
+    public PaymentResponse resolve(@PathVariable String id, @AuthenticationPrincipal Jwt jwt, Authentication auth) {
+        return service.resolve(id, CurrentUser.id(jwt), CurrentUser.isAdmin(auth));
     }
 
     /** Provider callback: public route, authenticated by signature verification instead of a JWT. */

@@ -21,6 +21,9 @@ public interface BookingRepository extends JpaRepository<Booking, String> {
     @Query("select b from Booking b where b.id = :id")
     Optional<Booking> findForUpdate(@Param("id") String id);
 
+    @Query("select b from Booking b where b.status = :status and b.updatedAt >= :since")
+    List<Booking> findByStatusSince(@Param("status") Booking.Status status, @Param("since") Instant since);
+
     @Query("select b.id from Booking b where b.status = :status and b.expiresAt < :now")
     List<String> findExpiredIds(@Param("status") Booking.Status status, @Param("now") Instant now, Pageable pageable);
 }

@@ -130,7 +130,7 @@ public class ShowService {
     public InternalShow internalView(Long id) {
         Show s = shows.findDetailedById(id).orElseThrow(() -> BusinessException.notFound("SHOW_NOT_FOUND", "Show not found"));
         List<InternalSeat> seats = venueSeats.findByVenueIdOrderByRowLabelAscSeatNumberAsc(s.getVenue().getId()).stream()
-                .map(v -> new InternalSeat(v.getId(), v.label())).toList();
+                .map(v -> new InternalSeat(v.getId(), v.label(), v.getSeatType().name())).toList();
         return new InternalShow(s.getId(), s.getStatus().name(), s.getEvent().getTitle(), s.getStartTime(),
                 s.getPrice(), s.getCurrency(), seats);
     }

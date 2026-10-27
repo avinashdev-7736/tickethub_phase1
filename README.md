@@ -1,6 +1,7 @@
-# TicketHub - Phase 1
+# TicketHub - Phase 1 + Phase 2
 
 Event / movie ticket booking built as Spring Boot microservices.
+**Phase 2 (reliability):** transactional outbox + inbox, saga with refunds (compensation), dead-letter topics, reconciliation, replay - see [`docs/phase2/README.md`](docs/phase2/README.md).
 
 ```
                       +--------------------+
@@ -30,6 +31,7 @@ docker compose ps                      # wait until services are "healthy"
 ./scripts/demo.sh                      # browse -> book -> pay -> confirmed -> email
 ./scripts/concurrency-demo.sh          # two customers, one seat: one 201, one 409
 ```
+Windows PowerShell: `.\scripts\demo.ps1` and `.\scripts\concurrency-demo.ps1` (the `.sh` versions need Git Bash or WSL).
 Java/Maven route (without Docker for the services): `mvn -B verify`, start the infra with
 `docker compose up -d mysql kafka keycloak mailpit jaeger discovery-server config-server`, then run each
 service's `*Application` class from the IDE (defaults point at localhost).
@@ -61,13 +63,23 @@ Demo data (venue, a PUBLISHED event and an OPEN show) is seeded on first start (
 | Payment stuck / timeout -> expiry | mode=`PENDING`, book + pay, wait for `booking.expiry-minutes` (set it to 1 in `config-repo/booking-service.yml`) |
 | Slow payment provider (observability) | `.../mode?mode=SUCCESS&delayMs=4000`, then look at the trace in Jaeger |
 | Notification failure never affects booking | `docker compose stop mailpit`, pay: booking CONFIRMED, notification FAILED |
-| Kafka down at confirmation | stop kafka, pay: booking CONFIRMED, log `FAILED to publish`, metric `tickethub_booking_event_publish_failed_total` (Phase 2: outbox) |
+| Kafka down during a payment | `chaos.ps1 kafka-down`: events wait in the outbox (nothing lost); after Kafka returns the booking confirms and one email is sent |
 | Service failover | `docker compose --profile failover up -d`, then stop `booking-service`, calls keep working via instance 2 |
 | Circuit breaker | stop `booking-service`, call `GET /shows/{id}/seats` repeatedly: fast 503 `SEAT_STATE_UNAVAILABLE`, `/actuator/circuitbreakers` shows OPEN |
 | Duplicate webhook | send the same signed webhook twice; applied once (see `PaymentFlowTest`) |
 
+## Phase 2 drills (Windows PowerShell)
+```
+.\scripts\phase2\chaos.ps1 cancel-after-pay     # refund + CANCELLED
+.\scripts\phase2\chaos.ps1 late-payment         # REJECTED + refund
+.\scripts\phase2\chaos.ps1 kafka-down | mail-down | duplicate-webhook | silent-capture | restart-booking | poison
+.\scripts\phase2\burst.ps1 -Count 500           # consumer lag (see docs/phase2/KAFKA_RUNBOOK.md)
+```
+Kafka UI http://localhost:8085. Upgrading from Phase 1? Run `docker compose down -v` first (schema changed).
+
 ## Documents
-- `docs/API.md` - endpoints, errors, status models
+- `docs/phase2/` - Phase 2 overview, event catalog, saga design, Kafka runbook, incident notes
+- `docs/API.md` - endpoints, errors, status models (updated for Phase 2)
 - `docs/DECISIONS.md` - design decisions, trade-offs and **known Phase 1 gaps**
 - `docs/DEPLOYMENT.md` - RDS, Secrets Manager, S3, images, release and rollback
 - `docs/EVIDENCE_CHECKLIST.md` - how to verify every row of the Phase 1 API & Event Checklist

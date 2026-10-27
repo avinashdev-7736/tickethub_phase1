@@ -1,6 +1,7 @@
 package com.tickethub.booking.web;
 
 import com.tickethub.booking.dto.Dtos.BookingResponse;
+import com.tickethub.booking.dto.Dtos.BookingTimeline;
 import com.tickethub.booking.dto.Dtos.CreateBookingRequest;
 import com.tickethub.booking.dto.Dtos.CreateResult;
 import com.tickethub.booking.service.BookingService;
@@ -8,6 +9,7 @@ import com.tickethub.common.security.CurrentUser;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.Authentication;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.*;
@@ -34,6 +36,12 @@ public class BookingController {
     @GetMapping("/{id}")
     public BookingResponse get(@PathVariable String id, @AuthenticationPrincipal Jwt jwt) {
         return service.get(id, CurrentUser.id(jwt));
+    }
+
+    /** What happened to this booking and why (owner or ADMIN). */
+    @GetMapping("/{id}/timeline")
+    public BookingTimeline timeline(@PathVariable String id, @AuthenticationPrincipal Jwt jwt, Authentication auth) {
+        return service.timeline(id, CurrentUser.id(jwt), CurrentUser.isAdmin(auth));
     }
 
     @PostMapping("/{id}/cancel")

@@ -21,11 +21,22 @@ spring:
           jwk-set-uri: ${JWK_SET_URI:http://localhost:8180/realms/tickethub/protocol/openid-connect/certs}
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:29092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        max.block.ms: 3000
     consumer:
-      group-id: notification-service
+      group-id: ${NOTIFICATION_GROUP_ID:notification-service}
       auto-offset-reset: earliest
+      enable-auto-commit: false
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    listener:
+      observation-enabled: true
+    template:
+      observation-enabled: true
   mail:
     host: ${MAIL_HOST:localhost}
     port: ${MAIL_PORT:1025}
@@ -51,16 +62,51 @@ tickethub:
     key: ${INTERNAL_API_KEY:dev-internal-key}
   kafka:
     topic:
-      booking-confirmed: booking-confirmed
+      booking-events: booking.events
+      booking-confirmed: booking.confirmed # Legacy Phase 1 consumer topic
+      retention-ms: 604800000   # 7 days: how far back a replay can go (scenario 12)
 
 notification:
   from: ${MAIL_FROM:no-reply@tickethub.local}
+  group-id: ${NOTIFICATION_GROUP_ID:notification-service}
+  # scenario 12: a replay instance rebuilds records from the topic and sends NO email
+  replay-mode: ${NOTIFICATION_REPLAY_MODE:false}
+  # scenario 11: artificial per-message delay to make the consumer fall behind on purpose
+  simulated-delay-ms: ${NOTIFICATION_SIMULATED_DELAY_MS:0}
+  # a SENDING claim older than this is assumed to belong to a crashed instance and may be taken over
+  claim-timeout-minutes: 5
+  retry:
+    attempts: 4          # 1 original + 3 retries on delayed retry topics
+    delay-ms: 2000
+    multiplier: 3.0
+    max-delay-ms: 60000
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      mail:
+        sliding-window-size: 6
+        minimum-number-of-calls: 3
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 15s
+        permitted-number-of-calls-in-half-open-state: 2
+        record-exceptions:
+          - org.springframework.mail.MailException
+  ratelimiter:
+    instances:
+      mail:
+        limit-for-period: 20          # at most 20 emails ...
+        limit-refresh-period: 1s      # ... per second
+        timeout-duration: 0
 
 management:
+  health:
+    mail:
+      enabled: false   # a mail outage must not make the whole service look dead (it keeps consuming and retrying)
   endpoints:
     web:
       exposure:
-        include: health,info,prometheus,metrics
+        include: health,info,prometheus,metrics,circuitbreakers
   endpoint:
     health:
       probes:

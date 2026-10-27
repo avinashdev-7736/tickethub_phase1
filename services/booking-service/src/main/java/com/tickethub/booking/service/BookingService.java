@@ -6,6 +6,7 @@ import com.tickethub.booking.domain.BookingSeat;
 import com.tickethub.booking.domain.SeatReservation;
 import com.tickethub.booking.dto.Dtos.*;
 import com.tickethub.booking.repo.BookingRepository;
+import com.tickethub.booking.repo.SagaLogRepository;
 import com.tickethub.booking.repo.SeatReservationRepository;
 import com.tickethub.common.error.BusinessException;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -29,25 +30,31 @@ import java.util.stream.Collectors;
 public class BookingService {
 
     private static final Logger log = LoggerFactory.getLogger(BookingService.class);
+    private static final List<String> CATEGORY_RANK = List.of("STANDARD", "PREMIUM", "VIP");
 
     private final BookingRepository bookings;
     private final SeatReservationRepository reservations;
+    private final SagaLogRepository sagaEntries;
     private final EventClient eventClient;
-    private final BookingEventPublisher publisher;
+    private final BookingEvents events;
+    private final SagaLog saga;
     private final MeterRegistry metrics;
     private final TransactionTemplate tx;
     private final TransactionTemplate readTx;
     private final long expiryMinutes;
     private final int maxSeats;
 
-    public BookingService(BookingRepository bookings, SeatReservationRepository reservations, EventClient eventClient,
-                          BookingEventPublisher publisher, MeterRegistry metrics, PlatformTransactionManager tm,
+    public BookingService(BookingRepository bookings, SeatReservationRepository reservations, SagaLogRepository sagaEntries,
+                          EventClient eventClient, BookingEvents events, SagaLog saga, MeterRegistry metrics,
+                          PlatformTransactionManager tm,
                           @Value("${booking.expiry-minutes:10}") long expiryMinutes,
                           @Value("${booking.max-seats-per-booking:6}") int maxSeats) {
         this.bookings = bookings;
         this.reservations = reservations;
+        this.sagaEntries = sagaEntries;
         this.eventClient = eventClient;
-        this.publisher = publisher;
+        this.events = events;
+        this.saga = saga;
         this.metrics = metrics;
         this.tx = new TransactionTemplate(tm);
         this.readTx = new TransactionTemplate(tm);
@@ -87,14 +94,15 @@ public class BookingService {
         if (!show.startTime().isAfter(Instant.now())) {
             throw BusinessException.conflict("SHOW_STARTED", "This show has already started");
         }
-        Map<Long, String> labels = show.seats().stream().collect(Collectors.toMap(ShowSeat::id, ShowSeat::label));
-        if (!labels.keySet().containsAll(seatIds)) {
+        Map<Long, ShowSeat> byId = show.seats().stream().collect(Collectors.toMap(ShowSeat::id, s -> s));
+        if (!byId.keySet().containsAll(seatIds)) {
             throw BusinessException.badRequest("INVALID_SEATS", "One or more seats do not belong to this show's venue");
         }
         BigDecimal amount = show.price().multiply(BigDecimal.valueOf(seatIds.size())); // server-side price only
+        String category = highestCategory(seatIds.stream().map(id -> byId.get(id).type()).toList());
 
         try {
-            BookingResponse created = tx.execute(status -> persistNew(req.showId(), seatIds, labels, show, amount,
+            BookingResponse created = tx.execute(status -> persistNew(req.showId(), seatIds, byId, show, amount, category,
                     customerId, email, idempotencyKey));
             metrics.counter("tickethub.booking.created").increment();
             return new CreateResult(created, false);
@@ -111,8 +119,18 @@ public class BookingService {
         }
     }
 
-    private BookingResponse persistNew(Long showId, List<Long> seatIds, Map<Long, String> labels, ShowInfo show,
-                                       BigDecimal amount, String customerId, String email, String idemKey) {
+    private static String highestCategory(List<String> types) {
+        String best = "STANDARD";
+        for (String t : types) {
+            if (t != null && CATEGORY_RANK.indexOf(t) > CATEGORY_RANK.indexOf(best)) {
+                best = t;
+            }
+        }
+        return best;
+    }
+
+    private BookingResponse persistNew(Long showId, List<Long> seatIds, Map<Long, ShowSeat> byId, ShowInfo show,
+                                       BigDecimal amount, String category, String customerId, String email, String idemKey) {
         Booking b = new Booking();
         b.setId(UUID.randomUUID().toString());
         b.setCustomerId(customerId);
@@ -122,14 +140,16 @@ public class BookingService {
         b.setShowStartTime(show.startTime());
         b.setAmount(amount);
         b.setCurrency(show.currency());
+        b.setSeatCategory(category);
         b.setStatus(Booking.Status.PENDING_PAYMENT);
+        b.setRefundState(Booking.RefundState.NONE);
         b.setExpiresAt(Instant.now().plus(Duration.ofMinutes(expiryMinutes)));
         b.setIdempotencyKey(idemKey);
         for (Long seatId : seatIds) {
             BookingSeat bs = new BookingSeat();
             bs.setBooking(b);
             bs.setSeatId(seatId);
-            bs.setSeatLabel(labels.get(seatId));
+            bs.setSeatLabel(byId.get(seatId).label());
             b.getSeats().add(bs);
         }
         bookings.saveAndFlush(b);
@@ -144,6 +164,7 @@ public class BookingService {
             rows.add(r);
         }
         reservations.saveAllAndFlush(rows); // UNIQUE(show_id, seat_id): exactly one concurrent request wins
+        saga.record(b.getId(), null, b.getStatus().name(), "booking created, waiting for payment", null);
         MDC.put("bookingId", b.getId());
         try {
             log.info("Booking {} created for show {}, seats {}, amount {} {}", b.getId(), showId, seatIds, amount, show.currency());
@@ -171,22 +192,56 @@ public class BookingService {
         return readTx.execute(s -> toResponse(owned(bookings.findById(id), customerId)));
     }
 
+    /** "What happened to this booking and why?" Owner or ADMIN. */
+    public BookingTimeline timeline(String id, String requesterId, boolean admin) {
+        return readTx.execute(s -> {
+            Booking b = bookings.findById(id).orElseThrow(() -> BusinessException.notFound("BOOKING_NOT_FOUND", "Booking not found"));
+            if (!admin && !b.getCustomerId().equals(requesterId)) {
+                throw BusinessException.notFound("BOOKING_NOT_FOUND", "Booking not found");
+            }
+            List<TimelineEntry> entries = sagaEntries.findByBookingIdOrderByIdAsc(id).stream()
+                    .map(e -> new TimelineEntry(e.getAt(), e.getFromStatus(), e.getToStatus(), e.getReason(), e.getEventId())).toList();
+            return new BookingTimeline(b.getId(), b.getStatus().name(), b.refundOrNone().name(), b.currentEventSeq(),
+                    b.currentPaymentSeq(), entries);
+        });
+    }
+
+    /**
+     * Customer cancel.
+     * Unpaid: cancelled immediately. Confirmed: seats are released at once, a refund is requested through BookingCancelled,
+     * and the booking becomes CANCELLED when PaymentRefunded arrives.
+     */
     public BookingResponse cancel(String id, String customerId) {
         MDC.put("bookingId", id);
         try {
             return tx.execute(s -> {
                 Booking b = owned(bookings.findForUpdate(id), customerId);
-                if (b.getStatus() == Booking.Status.CANCELLED) {
+                Booking.Status from = b.getStatus();
+                if (from == Booking.Status.CANCELLED || from == Booking.Status.CANCELLING) {
                     return toResponse(b); // already cancelled: idempotent
                 }
-                if (b.getStatus() != Booking.Status.PENDING_PAYMENT) {
-                    throw BusinessException.conflict("BOOKING_NOT_CANCELLABLE",
-                            "Only an unpaid booking can be cancelled (current status: " + b.getStatus() + ")");
+                if (from == Booking.Status.PENDING_PAYMENT) {
+                    b.setStatus(Booking.Status.CANCELLED);
+                    reservations.deleteByBookingId(b.getId());
+                    saga.record(b.getId(), from.name(), b.getStatus().name(), "cancelled by customer before payment", null);
+                    log.info("Booking {} cancelled by customer; seats released", id);
+                    return toResponse(b);
                 }
-                b.setStatus(Booking.Status.CANCELLED);
-                reservations.deleteByBookingId(b.getId());
-                log.info("Booking {} cancelled by customer; seats released", id);
-                return toResponse(b);
+                if (from == Booking.Status.CONFIRMED) {
+                    if (!b.getShowStartTime().isAfter(Instant.now())) {
+                        throw BusinessException.conflict("SHOW_STARTED", "A booking cannot be cancelled after the show has started");
+                    }
+                    b.setStatus(Booking.Status.CANCELLING);
+                    b.setRefundState(Booking.RefundState.PENDING);
+                    reservations.deleteByBookingId(b.getId());
+                    String outId = events.cancelled(b, "CUSTOMER_REQUEST");
+                    saga.record(b.getId(), from.name(), b.getStatus().name(), "cancelled by customer after payment; refund requested", outId);
+                    metrics.counter("tickethub.booking.cancelled.refund").increment();
+                    log.info("Booking {} cancelling; refund requested", id);
+                    return toResponse(b);
+                }
+                throw BusinessException.conflict("BOOKING_NOT_CANCELLABLE",
+                        "A booking in status " + from + " cannot be cancelled");
             });
         } finally {
             MDC.remove("bookingId");
@@ -201,72 +256,6 @@ public class BookingService {
         return b;
     }
 
-    // ------------------------------------------------------------------ payment result (internal)
-
-    private record Outcome(BookingConfirmedEvent event, boolean notPayable, String status, Booking snapshot) { }
-
-    public InternalBooking applyPaymentResult(String id, PaymentResultRequest req) {
-        MDC.put("bookingId", id);
-        try {
-            Outcome out = tx.execute(s -> applyInTx(id, req));
-            if (out.event() != null) {
-                metrics.counter("tickethub.booking.confirmed").increment();
-                publisher.publish(out.event()); // after commit; failure never undoes the booking
-            }
-            if (out.notPayable()) {
-                throw BusinessException.conflict("BOOKING_NOT_PAYABLE",
-                        "Booking is " + out.status() + " and can no longer accept this payment result");
-            }
-            return toInternal(out.snapshot());
-        } finally {
-            MDC.remove("bookingId");
-        }
-    }
-
-    private Outcome applyInTx(String id, PaymentResultRequest req) {
-        Booking b = bookings.findForUpdate(id)
-                .orElseThrow(() -> BusinessException.notFound("BOOKING_NOT_FOUND", "Booking not found"));
-        Booking.Status st = b.getStatus();
-
-        if (req.status() == PaymentOutcome.SUCCESS) {
-            if (st == Booking.Status.CONFIRMED) {
-                return new Outcome(null, false, st.name(), b); // duplicate callback: idempotent
-            }
-            if (st == Booking.Status.PENDING_PAYMENT && b.getExpiresAt().isAfter(Instant.now())) {
-                b.setStatus(Booking.Status.CONFIRMED);
-                reservations.updateState(b.getId(), SeatReservation.State.BOOKED);
-                List<String> labels = b.getSeats().stream().map(BookingSeat::getSeatLabel).sorted().toList();
-                BookingConfirmedEvent event = new BookingConfirmedEvent(UUID.randomUUID().toString(),
-                        BookingConfirmedEvent.TYPE, b.getId(), b.getCustomerId(), b.getCustomerEmail(), b.getShowId(),
-                        b.getEventTitle(), b.getShowStartTime(), labels, b.getAmount(), b.getCurrency(), Instant.now());
-                log.info("Booking {} CONFIRMED (payment {})", id, req.paymentId());
-                return new Outcome(event, false, b.getStatus().name(), b);
-            }
-            if (st == Booking.Status.PENDING_PAYMENT) { // paid after the hold lapsed: close it properly, report conflict
-                b.setStatus(Booking.Status.EXPIRED);
-                reservations.deleteByBookingId(b.getId());
-                metrics.counter("tickethub.booking.expired").increment();
-                log.warn("Payment {} succeeded AFTER booking {} expired - needs refund (Phase 2)", req.paymentId(), id);
-            } else {
-                log.warn("Payment {} succeeded but booking {} is {} - needs refund (Phase 2)", req.paymentId(), id, st);
-            }
-            return new Outcome(null, true, b.getStatus().name(), b);
-        }
-
-        // FAILED
-        if (st == Booking.Status.PENDING_PAYMENT) {
-            b.setStatus(Booking.Status.PAYMENT_FAILED);
-            reservations.deleteByBookingId(b.getId());
-            metrics.counter("tickethub.booking.payment.failed").increment();
-            log.info("Booking {} PAYMENT_FAILED ({}); seats released", id, req.reason());
-            return new Outcome(null, false, b.getStatus().name(), b);
-        }
-        if (st == Booking.Status.CONFIRMED) {
-            throw BusinessException.conflict("BOOKING_ALREADY_CONFIRMED", "A confirmed booking cannot be marked as payment failed");
-        }
-        return new Outcome(null, false, st.name(), b); // already closed: nothing to do
-    }
-
     // ------------------------------------------------------------------ expiry (called by the scheduled job)
 
     /** @return true if this call expired the booking */
@@ -278,6 +267,7 @@ public class BookingService {
             }
             b.setStatus(Booking.Status.EXPIRED);
             reservations.deleteByBookingId(b.getId());
+            saga.record(b.getId(), Booking.Status.PENDING_PAYMENT.name(), b.getStatus().name(), "payment window expired", null);
             return true;
         });
         if (Boolean.TRUE.equals(expired)) {
@@ -299,6 +289,11 @@ public class BookingService {
                 .orElseThrow(() -> BusinessException.notFound("BOOKING_NOT_FOUND", "Booking not found"))));
     }
 
+    /** For reconciliation: bookings that became CONFIRMED recently. */
+    public List<InternalBooking> confirmedSince(Instant since) {
+        return readTx.execute(s -> bookings.findByStatusSince(Booking.Status.CONFIRMED, since).stream().map(this::toInternal).toList());
+    }
+
     // ------------------------------------------------------------------ mapping
 
     private BookingResponse toResponse(Booking b) {
@@ -306,11 +301,11 @@ public class BookingService {
                 .map(s -> new SeatInfo(s.getSeatId(), s.getSeatLabel()))
                 .sorted(Comparator.comparing(SeatInfo::label)).toList();
         return new BookingResponse(b.getId(), b.getShowId(), b.getEventTitle(), b.getShowStartTime(), b.getStatus().name(),
-                seats, b.getAmount(), b.getCurrency(), b.getExpiresAt(), b.getCreatedAt());
+                b.refundOrNone().name(), seats, b.getAmount(), b.getCurrency(), b.getSeatCategory(), b.getExpiresAt(), b.getCreatedAt());
     }
 
     private InternalBooking toInternal(Booking b) {
         return new InternalBooking(b.getId(), b.getCustomerId(), b.getStatus().name(), b.getAmount(), b.getCurrency(),
-                b.getExpiresAt(), b.getShowId());
+                b.getExpiresAt(), b.getShowId(), b.refundOrNone().name());
     }
 }

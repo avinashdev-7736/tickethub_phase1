@@ -31,38 +31,48 @@ Every response carries `X-Correlation-Id` (send your own to trace a request end 
 |---|---|---|---|
 | POST | `/bookings` | CUSTOMER | body `{showId, seatIds[]}`, optional `Idempotency-Key` header. 201 new, **200 replay of same key**. Amount = price x seats (server side). PENDING_PAYMENT with `expiresAt` |
 | GET | `/bookings/{id}` | owner | status, seats, amount, expiry |
-| POST | `/bookings/{id}/cancel` | owner | only PENDING_PAYMENT; releases seats; repeat is a no-op |
+| POST | `/bookings/{id}/cancel` | owner | PENDING_PAYMENT: cancelled at once. CONFIRMED (show not started): seats freed at once, status `CANCELLING`, refund requested, `CANCELLED` when refunded. Repeat is a no-op |
+| GET | `/bookings/{id}/timeline` | owner or ADMIN | **Phase 2.** Every state change with reason and event id: "what state is it in and why?" |
 
 Error codes: `SEAT_UNAVAILABLE` 409, `SHOW_NOT_BOOKABLE` 409, `SHOW_STARTED` 409, `INVALID_SEATS` 400, `DUPLICATE_SEATS` 400,
 `TOO_MANY_SEATS` 400, `IDEMPOTENCY_KEY_REUSED` 409, `BOOKING_NOT_FOUND` 404, `BOOKING_NOT_CANCELLABLE` 409, `EMAIL_REQUIRED` 400.
 
 Internal (never routed by gateway; header `X-Internal-Key`): `GET /internal/shows/{showId}/reserved-seats`,
-`GET /internal/bookings/{id}`, `POST /internal/bookings/{id}/payment-result {paymentId, status: SUCCESS|FAILED, reason}`.
+`GET /internal/bookings/{id}`, `GET /internal/bookings/confirmed?since=<ISO instant>` (reconciliation).
+**Phase 2:** the REST callback `POST /internal/bookings/{id}/payment-result` was removed. Payment tells Booking through events (`PaymentSucceeded` / `PaymentFailed`) - see `docs/phase2/EVENTS.md`.
 
 ## Payment Service
 | Method | Path | Auth | Notes |
 |---|---|---|---|
 | POST | `/payments` | owner of booking | body `{bookingId}` only - **no amount**. One payment per booking; repeat returns it |
-| GET | `/payments/{id}` | owner | `status`, `bookingSync` (SYNCED / FAILED_TO_SYNC / REJECTED_NEEDS_REFUND) |
-| POST | `/payments/webhook` | provider signature | verified HMAC-SHA256; duplicate event ids ignored |
-| POST | `/payments/simulator/mode?mode=&delayMs=` | ADMIN | simulated provider only: SUCCESS / FAILURE / RANDOM / PENDING |
-| POST | `/payments/simulator/complete?paymentId=&outcome=` | ADMIN | finish a PENDING payment like a callback would |
+| GET | `/payments/{id}` | owner or ADMIN | `status` (INITIATED, PENDING, UNKNOWN, AUTHORIZED, FAILED, SUCCESS, REFUNDING, REFUNDED), `refundId` |
+| POST | `/payments/{id}/resolve` | owner or ADMIN | **Phase 2.** For UNKNOWN / PENDING / AUTHORIZED: ask the provider what really happened and apply it |
+| POST | `/payments/webhook` | provider signature | verified HMAC-SHA256; duplicate event ids ignored; only forward state moves are applied (late/reordered callbacks are ignored); unknown payment -> 404 so the provider retries |
+| POST | `/payments/simulator/mode?mode=&delayMs=` | ADMIN | simulated provider only: SUCCESS / FAILURE / RANDOM / PENDING / TIMEOUT_CAPTURED / TIMEOUT_NOT_CAPTURED |
+| POST | `/payments/simulator/complete?paymentId=&outcome=` | ADMIN | finish a stuck payment like a callback would (SUCCESS / FAILED / AUTHORIZED) |
+| POST | `/payments/simulator/silent-capture?paymentId=` | ADMIN | provider captured the money but sends NO callback (reconciliation demo) |
 
 Simulated webhook: `X-Simulator-Signature: hex(HMAC-SHA256(body, PAYMENT_WEBHOOK_SECRET))`, body
 `{"eventId":"e1","providerReference":"sim_<paymentId>","status":"SUCCESS"}`.
 
-## Event (Kafka)
-Topic `booking-confirmed` (3 partitions, key = bookingId). Published once, when payment succeeded and the booking became CONFIRMED.
-```json
-{ "eventId":"uuid", "eventType":"BookingConfirmed", "bookingId":"...", "customerId":"...", "recipientEmail":"a@b.com",
-  "showId":1, "eventTitle":"...", "showStartTime":"...", "seats":["A1","A2"], "amount":1000.00, "currency":"INR", "occurredAt":"..." }
-```
-Consumers must tolerate duplicates (`eventId`). Payment failure, expiry and cancellation publish nothing in Phase 1.
+## Events (Kafka) - Phase 2
+Topics `booking.events` (BookingConfirmed / BookingRejected / BookingCancelled) and `payment.events` (PaymentSucceeded / PaymentFailed / PaymentRefunded), key = `bookingId`.
+Full catalog, envelope, ordering rules and the v1 -> v2 contract migration: **`docs/phase2/EVENTS.md`**.
+All events are published through a transactional outbox (never lost, possibly delivered twice) and consumed with an inbox (duplicates ignored).
+
+## Admin APIs (ADMIN token, direct service ports - not routed by the gateway)
+| Service | Method | Path | Purpose |
+|---|---|---|---|
+| Notification :8084 | GET | `/admin/dead-letters` | dead-lettered messages |
+| Notification :8084 | POST | `/admin/dead-letters/{id}/replay` | send one back; optional body `{"payload":"..."}` with a corrected payload |
+| Payment :8083 | POST | `/admin/reconciliation/run` | run reconciliation now, returns fixed / flagged findings |
+| Payment :8083 | GET | `/admin/reconciliation/findings` | recent findings |
+| Payment :8083 | GET / POST | `/admin/outbox`, `/admin/outbox/relay` | pending outbox events / publish now |
 
 ## Status models
 - Event: DRAFT -> PUBLISHED -> CANCELLED
 - Show: SCHEDULED -> OPEN -> SOLD_OUT / CANCELLED / COMPLETED (SOLD_OUT and COMPLETED are not set automatically in Phase 1)
-- Booking: PENDING_PAYMENT -> CONFIRMED | PAYMENT_FAILED | CANCELLED | EXPIRED
+- Booking: PENDING_PAYMENT -> CONFIRMED | PAYMENT_FAILED | CANCELLED | EXPIRED; paid too late -> REJECTED; cancelled after paying -> CANCELLING -> CANCELLED. `refundState`: NONE / PENDING / REFUNDED
 - Seat (per show): AVAILABLE -> RESERVED -> BOOKED (RESERVED/BOOKED are rows in `seat_reservation`; released = row deleted)
-- Payment: INITIATED -> PENDING -> SUCCESS | FAILED (CANCELLED / REFUNDED reserved for Phase 2)
-- Notification: PENDING -> SENT | FAILED
+- Payment (forward only, by rank): INITIATED < PENDING = UNKNOWN < AUTHORIZED < FAILED < SUCCESS < REFUNDING < REFUNDED
+- Notification: PENDING -> SENDING -> SENT | RETRYING | FAILED | REPLAYED

@@ -22,7 +22,7 @@ public class SecurityConfig {
                         .requestMatchers("/actuator/**", "/v3/api-docs/**", "/swagger-ui/**", "/swagger-ui.html").permitAll()
                         .requestMatchers("/internal/**").permitAll()
                         .requestMatchers(HttpMethod.POST, "/payments/webhook").permitAll() // signature-verified in the service
-                        .requestMatchers("/payments/simulator/**").hasRole("ADMIN")
+                        .requestMatchers("/payments/simulator/**", "/admin/**").hasRole("ADMIN")
                         .anyRequest().authenticated())
                 .oauth2ResourceServer(o -> o
                         .jwt(j -> j.jwtAuthenticationConverter(converter))

@@ -1,0 +1,41 @@
+# Alert rules (view them at http://localhost:9090/alerts). They answer: "what do I look at first when something is wrong?"
+groups:
+  - name: tickethub-messaging
+    rules:
+      - alert: ConsumerLagHigh
+        expr: max by (application) (kafka_consumer_fetch_manager_records_lag_max) > 100
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.application }} is more than 100 messages behind"
+          description: "Look at the consumer lag panel in Grafana; check the consumer is alive, slow (mail provider?) or needs another instance."
+
+      - alert: OutboxBacklog
+        expr: tickethub_outbox_pending > 20
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.application }} has events stuck in the outbox"
+          description: "Events are committed but not reaching Kafka. Is Kafka reachable? Check tickethub_outbox_publish_failed_total."
+
+      - alert: DeadLettersAppeared
+        expr: increase(tickethub_notification_deadlettered_total[5m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "Messages were dead-lettered"
+          description: "Inspect with GET /admin/dead-letters on notification-service, fix the cause, then replay."
+
+      - alert: EmailProviderCircuitOpen
+        expr: resilience4j_circuitbreaker_state{name="mail", state="open"} == 1
+        for: 30s
+        labels: { severity: warning }
+        annotations:
+          summary: "The mail circuit breaker is open"
+          description: "The email provider is failing; notifications are retrying on delayed retry topics."
+
+      - alert: ReconciliationFlagged
+        expr: increase(tickethub_reconciliation_flagged_total[1h]) > 0
+        labels: { severity: info }
+        annotations:
+          summary: "Payment reconciliation flagged something"
+          description: "POST /admin/reconciliation/run on payment-service and read the FLAGGED findings."

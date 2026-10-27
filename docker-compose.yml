@@ -2,6 +2,9 @@
 #   docker compose up -d --build                         core stack (infra + 4 services + platform + monitoring)
 #   docker compose --profile failover up -d              adds a 2nd booking-service instance (discovery/failover demo)
 #   APP_PROFILES=docker,elk docker compose --profile elk up -d --build     adds ELK log search
+#   docker compose --profile scale up -d                  adds a 2nd notification-service consumer (scenario 11)
+#   docker compose --profile replay up -d                 adds a replay instance: new group, own DB, sends NO email (scenario 12)
+# Kafka UI: http://localhost:8085
 name: tickethub
 
 x-app-env: &app-env
@@ -21,7 +24,7 @@ services:
     image: mysql:8.4
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
-    ports: ["3306:3306"]
+    ports: ["${MYSQL_HOST_PORT:-3306}:3306"]
     volumes:
       - mysql-data:/var/lib/mysql
       - ./infra/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -53,6 +56,15 @@ services:
       timeout: 10s
       retries: 20
 
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports: ["8085:8080"]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: tickethub
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      kafka: { condition: service_healthy }
+
   keycloak:
     image: quay.io/keycloak/keycloak:24.0
     command: start-dev --import-realm
@@ -77,6 +89,7 @@ services:
     image: prom/prometheus:v2.53.0
     volumes:
       - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
     ports: ["9090:9090"]
 
   grafana:
@@ -188,8 +201,10 @@ services:
       PAYMENT_WEBHOOK_SECRET: ${PAYMENT_WEBHOOK_SECRET:-dev-webhook-secret}
       PAYMENT_RAZORPAY_KEY_ID: ${PAYMENT_RAZORPAY_KEY_ID:-}
       PAYMENT_RAZORPAY_KEY_SECRET: ${PAYMENT_RAZORPAY_KEY_SECRET:-}
+      KAFKA_BOOTSTRAP: kafka:9092
     depends_on:
       mysql: { condition: service_healthy }
+      kafka: { condition: service_healthy }
       config-server: { condition: service_healthy }
       discovery-server: { condition: service_healthy }
     healthcheck:
@@ -210,6 +225,7 @@ services:
       KAFKA_BOOTSTRAP: kafka:9092
       MAIL_HOST: mailpit
       MAIL_PORT: "1025"
+      NOTIFICATION_SIMULATED_DELAY_MS: ${NOTIFICATION_SIMULATED_DELAY_MS:-0}
     depends_on:
       mysql: { condition: service_healthy }
       kafka: { condition: service_healthy }
@@ -221,6 +237,39 @@ services:
       timeout: 5s
       retries: 10
       start_period: 60s
+
+  # ------------------------------------------------------------------ profile: scale (scenario 11)
+  notification-service-2:
+    image: tickethub/notification-service:local
+    profiles: ["scale"]
+    restart: on-failure
+    environment:
+      <<: *app-env
+      DB_URL: jdbc:mysql://mysql:3306/notification_db?serverTimezone=UTC
+      KAFKA_BOOTSTRAP: kafka:9092
+      MAIL_HOST: mailpit
+      MAIL_PORT: "1025"
+      NOTIFICATION_SIMULATED_DELAY_MS: ${NOTIFICATION_SIMULATED_DELAY_MS:-0}
+    depends_on:
+      notification-service: { condition: service_healthy }
+
+  # ------------------------------------------------------------------ profile: replay (scenario 12)
+  # Reads booking.events from the beginning with a NEW consumer group into its own database. It never sends email.
+  notification-replay:
+    image: tickethub/notification-service:local
+    profiles: ["replay"]
+    restart: on-failure
+    ports: ["8094:8084"]
+    environment:
+      <<: *app-env
+      DB_URL: jdbc:mysql://mysql:3306/notification_replay_db?serverTimezone=UTC
+      KAFKA_BOOTSTRAP: kafka:9092
+      MAIL_HOST: mailpit
+      MAIL_PORT: "1025"
+      NOTIFICATION_GROUP_ID: ${REPLAY_GROUP_ID:-notification-replay-1}
+      NOTIFICATION_REPLAY_MODE: "true"
+    depends_on:
+      notification-service: { condition: service_healthy }
 
   # ------------------------------------------------------------------ profile: failover (discovery demo)
   booking-service-2:
