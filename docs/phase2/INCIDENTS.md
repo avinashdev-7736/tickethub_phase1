@@ -31,7 +31,7 @@ Template: Trigger - Symptom - Where to look - Cause - Fix - Prevention - Observe
 - **Cause:** providers retry and reorder callbacks.
 - **Fix:** none needed.
 - **Prevention:** webhook event-id dedupe + forward-only state machine.
-- **Observed:** Passed on 2026-10-27. Booking `dc9070ca-9960-4a1c-a9b9-743a7f50b581` reached CONFIRMED once after a duplicate SUCCESS and late AUTHORIZED/FAILED callbacks; its timeline has one confirmation and Mailpit recorded exactly one new confirmation email.
+- **Observed:** Passed on 2026-10-28. Booking `1a4afb4e-15a7-4ce8-a88e-31b962702fbd` reached CONFIRMED once after a duplicate SUCCESS and late AUTHORIZED/FAILED callbacks; its timeline has one confirmation and Mailpit recorded exactly one new confirmation email.
 
 ## 4. Payment arrives after the booking was cancelled (`late-payment`)
 - **Trigger:** payment stuck PENDING, booking cancelled, provider then reports SUCCESS.
@@ -45,7 +45,7 @@ Template: Trigger - Symptom - Where to look - Cause - Fix - Prevention - Observe
 ## 5. Customer cancels after paying (`cancel-after-pay`)
 - **Expected symptom:** seats free at once, booking CANCELLING, then CANCELLED with refundState REFUNDED; cancellation email.
 - **Prevention:** `BookingCancelled` -> refund; seats are released first so the customer-visible action is instant.
-- **Observed:** Passed on 2026-10-27. Booking `b50997d8-1941-4fa9-8274-bcdb58abe47a` moved CONFIRMED -> CANCELLING -> CANCELLED with refundState REFUNDED; Mailpit received confirmation and cancellation emails, and seat B1 was AVAILABLE afterward.
+- **Observed:** Passed on 2026-10-28. Booking `d93a9fd6-1aa4-4661-9b1a-2c74d1770ac7` moved CONFIRMED -> CANCELLING -> CANCELLED with refundState REFUNDED; Mailpit received confirmation and cancellation emails, and seat A2 was AVAILABLE afterward.
 
 ## 6. The provider captured money but no callback ever came (`silent-capture`)
 - **Trigger:** `POST /payments/simulator/silent-capture`, then `POST :8083/admin/reconciliation/run`.
